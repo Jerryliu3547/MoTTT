@@ -1,0 +1,22 @@
+# Default configuration for MoTTT (Target: Qwen2.5-0.5B on GPU)
+model:
+  base_model_name: "Qwen/Qwen2.5-0.5B"
+  hidden_dim: 896
+  num_layers: 24
+  num_reasoning_experts: 4
+  rank: 16
+  alpha: 16.0
+  lambda_bal: 0.01
+  temperature: 1.0
+
+training:
+  inner_lr: 0.001
+  inner_steps: 1
+  outer_lr: 0.0001
+  batch_size: 4
+  chunk_size: 256
+  target_context_length: 8192
+
+data:
+  dataset_name: "gsm8k"
+  depth_ratios: [0.1, 0.3, 0.5, 0.7, 0.9]

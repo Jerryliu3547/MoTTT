@@ -1,0 +1,22 @@
+# Lightweight Smoke Test Configuration (CPU / Mock execution)
+model:
+  base_model_name: "dummy-cpu"
+  hidden_dim: 64
+  num_layers: 2
+  num_reasoning_experts: 4
+  rank: 8
+  alpha: 8.0
+  lambda_bal: 0.01
+  temperature: 1.0
+
+training:
+  inner_lr: 0.01
+  inner_steps: 2
+  outer_lr: 0.001
+  batch_size: 2
+  chunk_size: 32
+  target_context_length: 128
+
+data:
+  dataset_name: "synthetic"
+  depth_ratios: [0.2, 0.5, 0.8]

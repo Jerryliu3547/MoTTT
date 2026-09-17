@@ -1,0 +1,26 @@
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.pytest_cache/
+
+# Datasets and checkpoints
+data/
+datasets/
+checkpoints/
+outputs/
+*.pt
+*.bin
+*.safetensors
+
+# Logs and system
+*.log
+.DS_Store
