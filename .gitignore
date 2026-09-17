@@ -13,10 +13,10 @@ __pycache__/
 .pytest_cache/
 
 # Datasets and checkpoints
-data/
-datasets/
-checkpoints/
-outputs/
+/data/
+/datasets/
+/checkpoints/
+/outputs/
 *.pt
 *.bin
 *.safetensors
