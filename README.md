@@ -106,6 +106,9 @@ python experiments/gsm8k/model_test.py \
     --test_data experiments/gsm8k/data/test_distractor.jsonl \
     --checkpoint_dir experiments/gsm8k/checkpoints \
     --output_dir experiments/gsm8k/results
+
+# 4. Interactive Standalone Jupyter Notebook (All-in-One: Prep -> Train -> Test -> Viz)
+jupyter lab experiments/gsm8k/notebook/gsm8k_experiment.ipynb
 ```
 
 ### B. LongBench-v2 Experiment Suite (`experiments/longbenchv2/`)
@@ -143,7 +146,8 @@ MoTTT/
 │   ├── gsm8k/
 │   │   ├── data_preparation.py # GSM8K distractor preparation
 │   │   ├── model_train.py      # Qwen2.5-0.5B + MoTTT training loop
-│   │   └── model_test.py       # Test-time scratchpad adaptation & evaluation
+│   │   ├── model_test.py       # Test-time scratchpad adaptation & evaluation
+│   │   └── notebook/           # Standalone Jupyter notebook (prep -> train -> test -> viz)
 │   └── longbenchv2/
 │       ├── README.md           # LongBench-v2 specifications
 │       ├── data_preparation.py # LongBench-v2 task formatting
