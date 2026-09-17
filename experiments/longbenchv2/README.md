@@ -32,14 +32,14 @@ MoTTT decouples factual context absorption from reasoning:
 
 ## 3. Workflow & Usage
 
-### Data Preparation
 ```bash
-.venv/bin/python experiments/longbenchv2/data_preparation.py --split test --output_dir experiments/longbenchv2/data
-```
+conda activate mottt
 
-### Model Evaluation
-```bash
-.venv/bin/python experiments/longbenchv2/model_test.py \
+# Data Preparation
+python experiments/longbenchv2/data_preparation.py --split test --output_dir experiments/longbenchv2/data
+
+# Model Evaluation
+python experiments/longbenchv2/model_test.py \
     --test_data experiments/longbenchv2/data/longbenchv2_chunked.jsonl \
     --checkpoint_dir experiments/gsm8k/checkpoints \
     --output_dir experiments/longbenchv2/results

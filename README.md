@@ -9,28 +9,40 @@ MoTTT decouples factual ingestion / episodic memory from multi-step domain reaso
 
 ---
 
-## 1. Environment Setup
+## 1. Environment Setup (Conda)
 
-The local environment is built with **Python 3.12** and managed via `uv`.
+The environment is built with **Python 3.12** and managed via **Conda**.
 
-### Local CPU Environment (Current)
-To keep disk usage minimal and run without requiring local GPU resources:
+### Option A: Local CPU Environment (Current)
+To keep disk usage minimal and run locally without requiring GPU resources:
 ```bash
-# Activate virtual environment
-source .venv/bin/activate
+# 1. Create and activate the conda environment
+conda create -n mottt python=3.12 -y
+conda activate mottt
 
-# Or run commands directly via .venv
-.venv/bin/python scripts/run_smoke_test.py
-.venv/bin/pytest tests/ -v
+# 2. Install dependencies (CPU-optimized PyTorch build)
+pip install -r requirements-cpu.txt
+pip install -e .
+
+# (Or create directly via environment.yml)
+# conda env create -f environment.yml
+# conda activate mottt
 ```
 
-### Remote GPU Cluster Deployment
-When deploying to a remote machine equipped with NVIDIA GPUs (CUDA 12.4+):
+### Option B: Remote GPU Cluster Deployment (CUDA 12.4+)
+When deploying to a remote machine equipped with NVIDIA GPUs:
 ```bash
-uv venv --python python3.12 .venv
-source .venv/bin/activate
-uv pip install -r requirements-gpu.txt
-uv pip install -e .
+# 1. Create and activate the conda environment
+conda create -n mottt python=3.12 -y
+conda activate mottt
+
+# 2. Install GPU-accelerated PyTorch & dependencies
+pip install -r requirements-gpu.txt
+pip install -e .
+
+# (Or create directly via environment-gpu.yml)
+# conda env create -f environment-gpu.yml
+# conda activate mottt
 ```
 
 ---
@@ -44,8 +56,10 @@ MoTTT provides an automated data pipeline using Hugging Face's `openai/gsm8k` da
 
 ### Generating the Benchmark Dataset
 ```bash
+conda activate mottt
+
 # Generate distractor dataset (e.g. for test split)
-.venv/bin/python scripts/build_distractor_dataset.py \
+python scripts/build_distractor_dataset.py \
     --split test \
     --depth_ratios 0.1,0.3,0.5,0.7,0.9 \
     --target_context_tokens 4096 \
@@ -55,42 +69,85 @@ MoTTT provides an automated data pipeline using Hugging Face's `openai/gsm8k` da
 ### Evaluating Other Baseline Models on the Benchmark
 To benchmark any external Hugging Face model (e.g. `Qwen/Qwen2.5-0.5B`, LLaMA, Mistral) on the modified dataset:
 ```bash
+conda activate mottt
+
 # Run baseline evaluation on GPU
-.venv/bin/python scripts/evaluate_baseline.py \
+python scripts/evaluate_baseline.py \
     --dataset_path data/gsm8k_distractor/gsm8k_distractor_all.jsonl \
     --model_name_or_path Qwen/Qwen2.5-0.5B \
     --output_results results/qwen_baseline_results.json
 
 # Or test in mock mode on CPU:
-.venv/bin/python scripts/evaluate_baseline.py \
+python scripts/evaluate_baseline.py \
     --dataset_path data/gsm8k_distractor/gsm8k_distractor_all.jsonl \
     --mock
 ```
 
 ---
 
-## 3. Running Local Verification (Mock / CPU Mode)
+## 3. Dedicated Experiment Pipelines (`experiments/`)
+
+### A. GSM8K Experiment Suite (`experiments/gsm8k/`)
+```bash
+conda activate mottt
+
+# 1. Prepare distractor long-context datasets
+python experiments/gsm8k/data_preparation.py --depth_ratios 0.1,0.3,0.5,0.7,0.9 --output_dir experiments/gsm8k/data
+
+# 2. Train MoTTT with Qwen2.5-0.5B and Query-Aware Router
+python experiments/gsm8k/model_train.py \
+    --data_path experiments/gsm8k/data/train_distractor.jsonl \
+    --base_model_name Qwen/Qwen2.5-0.5B \
+    --output_dir experiments/gsm8k/checkpoints \
+    --epochs 3
+
+# 3. Test model: inner-loop scratchpad adaptation & depth evaluation
+python experiments/gsm8k/model_test.py \
+    --test_data experiments/gsm8k/data/test_distractor.jsonl \
+    --checkpoint_dir experiments/gsm8k/checkpoints \
+    --output_dir experiments/gsm8k/results
+```
+
+### B. LongBench-v2 Experiment Suite (`experiments/longbenchv2/`)
+See [experiments/longbenchv2/README.md](experiments/longbenchv2/README.md) for extreme long-context evaluation ($8k \to 100k$ tokens).
+
+---
+
+## 4. Running Local Verification (Mock / CPU Mode)
 
 All local tests run against lightweight synthetic tensors and mock modules without downloading heavy weights or external datasets:
 
 ```bash
-# Run unit tests (12 tests covering router, loss, scratchpad, GSM8K pipeline, and export)
-.venv/bin/pytest tests/ -v
+conda activate mottt
+
+# Run unit tests (13 tests covering router, loss, scratchpad, GSM8K, and experiment cycles)
+pytest tests/ -v
 
 # Run smoke test script
-.venv/bin/python scripts/run_smoke_test.py
+python scripts/run_smoke_test.py
 ```
 
 ---
 
-## 4. Directory Layout
+## 5. Directory Layout
 
 ```
 MoTTT/
 ├── ideas.md                    # Core mathematical and architecture specification
+├── environment.yml             # Conda environment definition (CPU / local)
+├── environment-gpu.yml         # Conda environment definition (CUDA GPU)
 ├── pyproject.toml              # Packaging and dependency configuration
 ├── requirements-cpu.txt        # CPU-optimized requirements (local)
 ├── requirements-gpu.txt        # CUDA requirements (remote GPU cluster)
+├── experiments/
+│   ├── gsm8k/
+│   │   ├── data_preparation.py # GSM8K distractor preparation
+│   │   ├── model_train.py      # Qwen2.5-0.5B + MoTTT training loop
+│   │   └── model_test.py       # Test-time scratchpad adaptation & evaluation
+│   └── longbenchv2/
+│       ├── README.md           # LongBench-v2 specifications
+│       ├── data_preparation.py # LongBench-v2 task formatting
+│       └── model_test.py       # LongBench-v2 evaluation runner
 ├── scripts/
 │   ├── run_smoke_test.py       # End-to-end CPU smoke verification
 │   ├── build_distractor_dataset.py # GSM8K distractor benchmark builder
@@ -113,5 +170,6 @@ MoTTT/
     ├── test_scratchpad_inner_loop.py
     ├── test_distractor_pipeline.py
     ├── test_mottt_model.py
-    └── test_gsm8k_pipeline.py
+    ├── test_gsm8k_pipeline.py
+    └── test_experiments_gsm8k.py
 ```
