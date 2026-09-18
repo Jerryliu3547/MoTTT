@@ -2,9 +2,15 @@
 """Run lightweight smoke verification of the MoTTT environment on CPU without downloading external datasets or models."""
 
 import sys
+from pathlib import Path
+
+# Ensure src/ is on sys.path even if not installed via pip install -e .
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 import torch
 import yaml
-from pathlib import Path
 
 from mottt.models.mottt_model import MoTTTModel
 from mottt.data.distractor_generator import PremiseQueryDecomposer, DistractorNeedleSynthesizer

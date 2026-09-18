@@ -9,6 +9,11 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Ensure src/ is on sys.path even if not installed via pip install -e .
+SRC_DIR = Path(__file__).resolve().parent.parent / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from mottt.data.dataset_exporter import load_distractor_jsonl
 
 

@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+# Ensure src/ is on sys.path even if not installed via pip install -e .
+SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader

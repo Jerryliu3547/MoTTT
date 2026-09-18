@@ -7,6 +7,11 @@ import sys
 from pathlib import Path
 from typing import List, Tuple
 
+# Ensure src/ is on sys.path even if not installed via pip install -e .
+SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
+if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 from mottt.data.gsm8k_loader import GSM8KExample, load_gsm8k_dataset
 from mottt.data.distractor_generator import (
     PremiseQueryDecomposer,
