@@ -480,11 +480,10 @@ for epoch in range(1, EPOCHS + 1):
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch")
     for step, batch in enumerate(pbar):
-        # -------------------------------------------------------------
-        # Step 1: Clear Scratchpad before processing each batch/question
-        # Guarantees zero episodic state leakage across questions
-        # -------------------------------------------------------------
-        model.reset_scratchpad()
+        optimizer.zero_grad()
+        batch_loss = 0.0
+        batch_task = 0.0
+        batch_bal = 0.0
 
         if not USE_MOCK and base_llm is not None:
             # Full GPU Tokenized Training Path
@@ -493,82 +492,119 @@ for epoch in range(1, EPOCHS + 1):
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
             labels = batch["labels"].to(DEVICE)
+            prompt_lens = batch["prompt_lens"]
+            current_bsz = input_ids.shape[0]
 
-            # Inner-loop adaptation on context representations
-            model.set_routing_gates(None)
-            for _ in range(INNER_STEPS):
-                ctx_out = base_llm(input_ids=ctx_ids, attention_mask=ctx_mask)
-                ctx_logits = ctx_out.logits
-                shift_ctx_logits = ctx_logits[..., :-1, :].contiguous()
-                shift_ctx_labels = ctx_ids[..., 1:].contiguous()
-                inner_loss = F.cross_entropy(shift_ctx_logits.view(-1, base_llm.config.vocab_size), shift_ctx_labels.view(-1))
+            for b in range(current_bsz):
+                # -------------------------------------------------------------
+                # Step 1: Reset Scratchpad for sample b - isolated episodic memory
+                # Guarantees zero state leakage across samples within the batch
+                # -------------------------------------------------------------
+                model.reset_scratchpad()
                 inner_opt.zero_grad()
-                inner_loss.backward()
-                inner_opt.step()
+                model.set_routing_gates(None)
 
-            # Outer-loop forward pass on query + solution with Query-Aware Routing
-            with torch.no_grad():
-                token_embs = base_llm.model.embed_tokens(input_ids)
-            q_embs = []
-            for i, p_len in enumerate(batch["prompt_lens"]):
+                # Step 2: Inner-loop adaptation exclusively on sample b's context
+                b_ctx_ids = ctx_ids[b : b + 1]
+                b_ctx_mask = ctx_mask[b : b + 1]
+                for _ in range(INNER_STEPS):
+                    ctx_out = base_llm(input_ids=b_ctx_ids, attention_mask=b_ctx_mask)
+                    ctx_logits = ctx_out.logits
+                    shift_ctx_logits = ctx_logits[..., :-1, :].contiguous()
+                    shift_ctx_labels = b_ctx_ids[..., 1:].contiguous()
+                    inner_loss = F.cross_entropy(shift_ctx_logits.view(-1, base_llm.config.vocab_size), shift_ctx_labels.view(-1))
+                    inner_opt.zero_grad()
+                    inner_loss.backward()
+                    inner_opt.step()
+
+                # Step 3: Outer-loop forward pass on sample b's query + solution
+                b_input_ids = input_ids[b : b + 1]
+                b_attn_mask = attention_mask[b : b + 1]
+                b_labels = labels[b : b + 1]
+
+                with torch.no_grad():
+                    token_embs = base_llm.model.embed_tokens(b_input_ids)
+                p_len = prompt_lens[b]
                 p_len_clamped = max(1, min(p_len, token_embs.shape[1]))
-                q_embs.append(token_embs[i, :p_len_clamped].mean(dim=0))
-            q = torch.stack(q_embs, dim=0)
+                q = token_embs[0, :p_len_clamped].mean(dim=0, keepdim=True)
 
-            gates, logits = model.router(token_embs, q)
-            model.set_routing_gates(gates)
+                gates, logits = model.router(token_embs, q)
+                model.set_routing_gates(gates)
 
-            optimizer.zero_grad()
-            outputs = base_llm(input_ids=input_ids, attention_mask=attention_mask)
-            vocab_logits = outputs.logits
+                outputs = base_llm(input_ids=b_input_ids, attention_mask=b_attn_mask)
+                vocab_logits = outputs.logits
 
-            shift_logits = vocab_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+                shift_logits = vocab_logits[..., :-1, :].contiguous()
+                shift_labels = b_labels[..., 1:].contiguous()
 
-            task_loss = loss_fn(shift_logits.view(-1, base_llm.config.vocab_size).float(), shift_labels.view(-1))
-            bal_loss = model.compute_auxiliary_loss(logits)
+                task_loss = loss_fn(shift_logits.view(-1, base_llm.config.vocab_size).float(), shift_labels.view(-1))
+                bal_loss = model.compute_auxiliary_loss(logits)
 
-            outer_loss = task_loss + bal_loss
-            outer_loss.backward()
+                sample_loss = task_loss + bal_loss
+                # Accumulate outer gradients scaled by 1 / current_bsz for reasoning experts & router
+                (sample_loss / current_bsz).backward()
+
+                batch_loss += sample_loss.item() / current_bsz
+                batch_task += task_loss.item() / current_bsz
+                batch_bal += bal_loss.item() / current_bsz
+
+            # Step outer optimizer once across the batch
             optimizer.step()
-
             model.reset_scratchpad()
         else:
             # Mock / CPU Verification Path
-            model.set_routing_gates(None)
             ctx = batch["context_states"].to(DEVICE)
-            for _ in range(INNER_STEPS):
-                chunk_out = model.base_backbone(ctx)
-                inner_loss = F.mse_loss(chunk_out, torch.zeros_like(chunk_out))
-                inner_opt.zero_grad()
-                inner_loss.backward()
-                inner_opt.step()
-
-            optimizer.zero_grad()
             h = batch["hidden_states"].to(DEVICE)
             q = batch["query_embedding"].to(DEVICE)
             targets = batch["target_labels"].to(DEVICE)
+            current_bsz = h.shape[0]
 
-            blended, gates, logits = model(h, q)
-            preds = head(blended)
+            for b in range(current_bsz):
+                # Step 1: Reset Scratchpad for sample b
+                model.reset_scratchpad()
+                inner_opt.zero_grad()
+                model.set_routing_gates(None)
 
-            task_loss = loss_fn(preds.view(-1, preds.shape[-1]), targets.view(-1))
-            bal_loss = model.compute_auxiliary_loss(logits)
+                # Step 2: Inner-loop adaptation exclusively on sample b's context
+                b_ctx = ctx[b : b + 1]
+                for _ in range(INNER_STEPS):
+                    chunk_out = model.base_backbone(b_ctx)
+                    inner_loss = F.mse_loss(chunk_out, torch.zeros_like(chunk_out))
+                    inner_opt.zero_grad()
+                    inner_loss.backward()
+                    inner_opt.step()
 
-            outer_loss = task_loss + bal_loss
-            outer_loss.backward()
+                # Step 3: Outer-loop forward on sample b
+                b_h = h[b : b + 1]
+                b_q = q[b : b + 1]
+                b_targets = targets[b : b + 1]
+
+                blended, gates, logits = model(b_h, b_q)
+                preds = head(blended)
+
+                task_loss = loss_fn(preds.view(-1, preds.shape[-1]), b_targets.view(-1))
+                bal_loss = model.compute_auxiliary_loss(logits)
+
+                sample_loss = task_loss + bal_loss
+                # Accumulate outer gradients scaled by 1 / current_bsz
+                (sample_loss / current_bsz).backward()
+
+                batch_loss += sample_loss.item() / current_bsz
+                batch_task += task_loss.item() / current_bsz
+                batch_bal += bal_loss.item() / current_bsz
+
+            # Step outer optimizer once across the batch
             optimizer.step()
-
             model.reset_scratchpad()
 
-        total_epoch_loss += outer_loss.item()
-        total_task_loss += task_loss.item()
-        total_bal_loss += bal_loss.item()
+        total_epoch_loss += batch_loss
+        total_task_loss += batch_task
+        total_bal_loss += batch_bal
 
         pbar.set_postfix({
-            "loss": f"{outer_loss.item():.4f}",
-            "task": f"{task_loss.item():.4f}",
-            "bal": f"{bal_loss.item():.5f}",
+            "loss": f"{batch_loss:.4f}",
+            "task": f"{batch_task:.4f}",
+            "bal": f"{batch_bal:.5f}",
         })
 
     avg_loss = total_epoch_loss / len(dataloader)
