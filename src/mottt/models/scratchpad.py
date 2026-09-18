@@ -46,7 +46,9 @@ class LoRALinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         base_out = self.base_layer(x)
-        lora_out = (self.dropout(x) @ self.lora_A.T @ self.lora_B.T) * self.scaling
+        A = self.lora_A.to(dtype=x.dtype) if self.lora_A.dtype != x.dtype else self.lora_A
+        B = self.lora_B.to(dtype=x.dtype) if self.lora_B.dtype != x.dtype else self.lora_B
+        lora_out = (self.dropout(x) @ A.T @ B.T) * self.scaling
         return base_out + lora_out
 
 

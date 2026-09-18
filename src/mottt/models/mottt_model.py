@@ -67,6 +67,7 @@ class MoTTTModel(nn.Module):
         base_backbone: Optional[nn.Module] = None,
         all_linear: bool = False,
         target_modules: Optional[List[str]] = None,
+        num_layers: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -89,6 +90,16 @@ class MoTTTModel(nn.Module):
                 alpha=alpha,
                 target_modules=self.target_modules,
             )
+
+        # Determine number of transformer layers for layer-level gating
+        if num_layers is not None:
+            self.num_layers = num_layers
+        elif self.all_linear and hasattr(self.base_backbone, "num_molora_layers"):
+            self.num_layers = self.base_backbone.num_molora_layers
+        elif hasattr(getattr(self.base_backbone, "config", None), "num_hidden_layers"):
+            self.num_layers = self.base_backbone.config.num_hidden_layers
+        else:
+            self.num_layers = 1
 
         # 2. Dynamic Memory Scratchpad (Test-Time LoRA, index 0 in expert set)
         self.scratchpad_lora = ReasoningLoRAExpert(
@@ -113,12 +124,14 @@ class MoTTTModel(nn.Module):
         self.router = QueryAwareRouter(
             hidden_dim=hidden_dim,
             num_reasoning_experts=num_reasoning_experts,
+            num_layers=self.num_layers,
             temperature=temperature,
         )
 
         # 5. Asymmetric Load Balancing Loss Criterion
         self.balance_criterion = AsymmetricBalancingLoss(
             num_reasoning_experts=num_reasoning_experts,
+            num_layers=self.num_layers,
             lambda_bal=lambda_bal,
             temperature=temperature,
         )

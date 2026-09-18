@@ -155,3 +155,66 @@ def test_mottt_model_all_linear_injection_and_forward():
         submod = dict(model.base_backbone.named_modules())[name]
         assert torch.all(submod.scratchpad_lora_B == 0.0)
 
+
+def test_multi_layer_molora_routing_assignment():
+    """Verify layer index detection and layer-specific gate assignment across transformer blocks."""
+    class Block(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.q_proj = nn.Linear(dim, dim)
+            self.o_proj = nn.Linear(dim, dim)
+        def forward(self, x):
+            return self.o_proj(self.q_proj(x))
+
+    class MultiBlockBackbone(nn.Module):
+        def __init__(self, dim, num_layers=3):
+            super().__init__()
+            self.layers = nn.ModuleList([Block(dim) for _ in range(num_layers)])
+        def forward(self, x):
+            for layer in self.layers:
+                x = layer(x)
+            return x
+
+    dim = 32
+    num_blocks = 3
+    backbone = MultiBlockBackbone(dim=dim, num_layers=num_blocks)
+
+    model = MoTTTModel(
+        hidden_dim=dim,
+        num_reasoning_experts=4,
+        rank=4,
+        alpha=4.0,
+        base_backbone=backbone,
+        all_linear=True,
+    )
+
+    assert model.num_layers == num_blocks
+    assert hasattr(model.base_backbone, "num_molora_layers")
+    assert model.base_backbone.num_molora_layers == num_blocks
+
+    # Verify each module's layer_idx was detected properly
+    for i, layer in enumerate(model.base_backbone.layers):
+        assert layer.q_proj.layer_idx == i
+        assert layer.o_proj.layer_idx == i
+
+    # Forward pass
+    x = torch.randn(2, 6, dim)
+    q = torch.randn(2, dim)
+    blended, gates, logits = model(x, q)
+
+    assert gates.shape == (2, 6, num_blocks, 5)
+    assert logits.shape == (2, 6, num_blocks, 5)
+
+    # Verify each layer received its distinct slice of gates
+    for i, layer in enumerate(model.base_backbone.layers):
+        expected_gate_i = gates[..., i, :]
+        assert torch.allclose(layer.q_proj.active_gates, expected_gate_i)
+        assert torch.allclose(layer.o_proj.active_gates, expected_gate_i)
+
+    # Context adaptation mode: clearing gates sets active_gates to None
+    model.set_routing_gates(None)
+    for layer in model.base_backbone.layers:
+        assert layer.q_proj.active_gates is None
+        assert layer.o_proj.active_gates is None
+
+

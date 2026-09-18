@@ -466,6 +466,7 @@ def main():
         "base_model_name": args.base_model_name,
         "hidden_dim": hidden_dim,
         "num_reasoning_experts": args.num_experts,
+        "num_layers": model.num_layers,
         "rank": args.rank,
         "alpha": args.alpha,
         "lambda_bal": args.lambda_bal,

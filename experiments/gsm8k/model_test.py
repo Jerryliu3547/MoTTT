@@ -26,17 +26,29 @@ from mottt.data.dataset_exporter import load_distractor_jsonl
 
 
 def extract_predicted_answer(text: str) -> str:
-    """Extract numeric answer from model generation."""
+    """Extract numeric answer from model generation safely."""
+    # Priority 1: Match '#### [answer]' pattern
     if "####" in text:
-        ans = text.split("####")[-1].strip()
-        ans = re.sub(r"[,$]", "", ans).split()[0].strip()
-        return ans
-    match = re.search(r"(?:the\s+answer\s+is\s+|is\s+|equal\s+to\s+)([-+]?\d+(?:\.\d+)?)", text, re.IGNORECASE)
+        after_hash = text.split("####")[-1].strip()
+        cleaned = re.sub(r"[,$]", "", after_hash).strip()
+        tokens = cleaned.split()
+        if tokens:
+            return tokens[0].strip()
+
+    # Priority 2: 'The answer is [number]'
+    match = re.search(
+        r"(?:the\s+answer\s+is\s+|is\s+|equal\s+to\s+)([-+]?\d+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE,
+    )
     if match:
         return match.group(1).replace(",", "").strip()
+
+    # Priority 3: Last number in the text
     numbers = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
     if numbers:
         return numbers[-1].replace(",", "").strip()
+
     return ""
 
 
@@ -93,6 +105,11 @@ def parse_args():
         help="Maximum new tokens to generate per answer (default: 512, covers 100% of GSM8K reasoning chains)",
     )
     parser.add_argument(
+        "--show_outputs",
+        action="store_true",
+        help="Print model generation text, question, and answers to the terminal for test samples",
+    )
+    parser.add_argument(
         "--mock",
         action="store_true",
         help="Run in mock/CPU mode with synthetic backbone",
@@ -123,6 +140,7 @@ def main():
             cfg = json.load(f)
         hidden_dim = cfg.get("hidden_dim", 64 if args.mock else 896)
         num_experts = cfg.get("num_reasoning_experts", 4)
+        num_layers = cfg.get("num_layers", None)
         rank = cfg.get("rank", 16)
         alpha = cfg.get("alpha", 16.0)
         base_model_name = args.base_model_name or cfg.get("base_model_name", "Qwen/Qwen2.5-0.5B")
@@ -130,11 +148,13 @@ def main():
         print("Warning: training_config.json not found, using defaults.")
         hidden_dim = 64 if args.mock else 896
         num_experts = 4
+        num_layers = None
         rank = 16
         alpha = 16.0
         base_model_name = args.base_model_name or "Qwen/Qwen2.5-0.5B"
 
     device = "cuda" if (torch.cuda.is_available() and not args.mock) else "cpu"
+    torch_dtype = torch.float16 if (torch.cuda.is_available() and not args.mock) else torch.float32
 
     # Optional: Load base model & tokenizer for end-to-end token generation
     hf_tokenizer = None
@@ -146,18 +166,23 @@ def main():
             hf_tokenizer = AutoTokenizer.from_pretrained(base_model_name, trust_remote_code=True)
             hf_model = AutoModelForCausalLM.from_pretrained(
                 base_model_name,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                torch_dtype=torch_dtype,
                 device_map="auto" if torch.cuda.is_available() else None,
                 trust_remote_code=True,
             )
             if hasattr(hf_model, "generation_config") and hf_model.generation_config is not None:
                 hf_model.generation_config.max_length = None
                 hf_model.generation_config.max_new_tokens = args.max_new_tokens
+            if hasattr(hf_model, "config") and hf_model.config is not None:
+                hf_model.config.max_length = None
             hf_pipeline_gen = hf_pipeline(
                 "text-generation",
                 model=hf_model,
                 tokenizer=hf_tokenizer,
             )
+            if hasattr(hf_pipeline_gen.model, "generation_config") and hf_pipeline_gen.model.generation_config is not None:
+                hf_pipeline_gen.model.generation_config.max_length = None
+                hf_pipeline_gen.model.generation_config.max_new_tokens = args.max_new_tokens
             print(f"Successfully loaded {base_model_name} generation pipeline.")
         except Exception as e:
             print(f"Notice: Could not load Hugging Face model {base_model_name}: {e}")
@@ -183,6 +208,7 @@ def main():
         alpha=alpha,
         base_backbone=base_backbone,
         all_linear=True,
+        num_layers=num_layers,
     ).to(device)
 
     # Load router weights if present
@@ -207,6 +233,9 @@ def main():
             for expert, state in zip(model.reasoning_experts, saved_experts):
                 expert.load_state_dict(state)
             print(f"Loaded {len(saved_experts)} reasoning experts from {exp_weights}")
+
+    if not args.mock and hf_model is not None:
+        model = model.to(device, dtype=torch_dtype)
 
     # Inner-loop optimizer for dynamic scratchpad LoRA
     inner_params = model.get_scratchpad_parameters()
@@ -274,9 +303,6 @@ def main():
                 gates, logits = model.router(q_emb.unsqueeze(1), q_emb)
             model.set_routing_gates(gates)
 
-            avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
-            scratchpad_weight = float(avg_gates[0])
-            reasoning_weights = [float(w) for w in avg_gates[1:]]
         else:
             # Mock mode
             dummy_chunk = torch.randn(4, hidden_dim, device=device)
@@ -292,9 +318,35 @@ def main():
                 h_state = torch.randn(1, 8, hidden_dim, device=device)
                 blended, gates, logits = model(h_state, q_emb)
 
-                avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
-                scratchpad_weight = float(avg_gates[0])
-                reasoning_weights = [float(w) for w in avg_gates[1:]]
+        # Gate statistics extraction (supports layer-level gates [..., num_layers, 1 + E] and global gates)
+        if gates.dim() >= 3 and gates.shape[-2] > 1:
+            lg = gates.squeeze(0) if gates.shape[0] == 1 else gates
+            if lg.dim() == 3:  # [seq_len, num_layers, 1 + E]
+                lg = lg.mean(dim=0)  # [num_layers, 1 + E]
+            scratchpad_per_layer = lg[:, 0].cpu().tolist()
+            scratchpad_weight = float(sum(scratchpad_per_layer) / len(scratchpad_per_layer))
+            reasoning_weights = lg[:, 1:].mean(dim=0).cpu().tolist()
+
+            num_l = len(scratchpad_per_layer)
+            n_third = max(1, num_l // 3)
+            early_pad = float(sum(scratchpad_per_layer[:n_third]) / n_third)
+            mid_pad = (
+                float(sum(scratchpad_per_layer[n_third : 2 * n_third]) / max(1, len(scratchpad_per_layer[n_third : 2 * n_third])))
+                if num_l >= 3 else scratchpad_weight
+            )
+            late_pad = (
+                float(sum(scratchpad_per_layer[2 * n_third :]) / max(1, len(scratchpad_per_layer[2 * n_third :])))
+                if num_l >= 3 else scratchpad_weight
+            )
+
+            gate_stats["scratchpad_early"].append(early_pad)
+            gate_stats["scratchpad_mid"].append(mid_pad)
+            gate_stats["scratchpad_late"].append(late_pad)
+            gate_stats["layer_scratchpad_profile"].append(scratchpad_per_layer)
+        else:
+            avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
+            scratchpad_weight = float(avg_gates[0])
+            reasoning_weights = [float(w) for w in avg_gates[1:]]
 
         gate_stats["scratchpad"].append(scratchpad_weight)
         gate_stats["reasoning_mean"].append(sum(reasoning_weights) / len(reasoning_weights))
@@ -342,12 +394,27 @@ def main():
             "scratchpad": f"{scratchpad_weight:.3f}",
         })
 
+        # Display model generation output if requested, or for the first 2 samples as preview
+        if args.show_outputs or idx < 2:
+            status_str = "CORRECT ✓" if is_correct else "INCORRECT ✗"
+            preview_note = " (Preview - pass --show_outputs to display all)" if (not args.show_outputs and idx < 2) else ""
+            tqdm.write(
+                f"\n{'=' * 70}\n"
+                f"[Sample {idx + 1}/{len(records)} | Needle Depth: {depth:.2f} | Scratchpad Gate: {scratchpad_weight:.3f} | {status_str}]{preview_note}\n"
+                f"Question:     {rec.get('query', '').strip()}\n"
+                f"Gold Answer:  {gold_ans}\n"
+                f"Predicted:    {pred_ans}\n"
+                f"Model Output:\n{gen_text.strip()}\n"
+                f"{'=' * 70}"
+            )
+
         detailed_results.append({
             "id": rec.get("id"),
             "depth_ratio": depth,
             "gold_answer": gold_ans,
             "pred_answer": pred_ans,
             "correct": is_correct,
+            "model_output": gen_text.strip(),
             "scratchpad_gate": scratchpad_weight,
             "reasoning_expert_gates": reasoning_weights,
         })
@@ -357,8 +424,8 @@ def main():
         # -------------------------------------------------------------
         model.reset_scratchpad()
 
-        if (idx + 1) % 5 == 0 or (idx + 1) == len(records):
-            print(f"  Tested {idx + 1}/{len(records)} | Acc: {total_correct / (idx + 1) * 100:.1f}%")
+        if not args.show_outputs and ((idx + 1) % 10 == 0 or (idx + 1) == len(records)):
+            tqdm.write(f"  Tested {idx + 1}/{len(records)} | Running Acc: {running_acc:.1f}%")
 
     # 5. Compile Final Evaluation Report
     overall_acc = (total_correct / len(records) * 100) if records else 0.0
@@ -373,6 +440,14 @@ def main():
     print("\nRouter Gate Allocation Statistics:")
     print(f"  - Scratchpad Gate Share (C={{0}}):        {mean_scratchpad_gate * 100:.1f}%")
     print(f"  - Mean Reasoning Expert Share (R={{1..E}}): {mean_reasoning_gate * 100:.1f}%")
+    if gate_stats["scratchpad_early"]:
+        mean_early = sum(gate_stats["scratchpad_early"]) / len(gate_stats["scratchpad_early"])
+        mean_mid = sum(gate_stats["scratchpad_mid"]) / len(gate_stats["scratchpad_mid"])
+        mean_late = sum(gate_stats["scratchpad_late"]) / len(gate_stats["scratchpad_late"])
+        print(f"  - Layer-Level Scratchpad Profile:")
+        print(f"      * Early Layers (Context Ingestion):    {mean_early * 100:.1f}%")
+        print(f"      * Middle Layers (Representation Trans): {mean_mid * 100:.1f}%")
+        print(f"      * Late Layers (Clean Reasoning Exec):   {mean_late * 100:.1f}%")
     print("\nAccuracy Breakdown by Needle Depth Ratio (Lost-in-the-Middle Resilience):")
     depth_report = {}
     for depth in sorted(depth_stats.keys()):
@@ -397,6 +472,12 @@ def main():
         "depth_breakdown": depth_report,
         "detailed_predictions": detailed_results,
     }
+    if gate_stats["scratchpad_early"]:
+        report_data["layer_scratchpad_distribution"] = {
+            "early_layers_mean": sum(gate_stats["scratchpad_early"]) / len(gate_stats["scratchpad_early"]),
+            "middle_layers_mean": sum(gate_stats["scratchpad_mid"]) / len(gate_stats["scratchpad_mid"]),
+            "late_layers_mean": sum(gate_stats["scratchpad_late"]) / len(gate_stats["scratchpad_late"]),
+        }
     report_file = out_dir / "gsm8k_eval_report.json"
     with open(report_file, "w", encoding="utf-8") as f:
         json.dump(report_data, f, indent=2)

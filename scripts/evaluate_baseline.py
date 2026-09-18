@@ -14,19 +14,27 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from tqdm import tqdm
+
 from mottt.data.dataset_exporter import load_distractor_jsonl
 
 
 def extract_predicted_answer(generated_text: str) -> str:
-    """Extract numeric answer from model generation."""
+    """Extract numeric answer from model generation safely."""
     # Priority 1: Match '#### [answer]' pattern
     if "####" in generated_text:
-        ans = generated_text.split("####")[-1].strip()
-        ans = re.sub(r"[,$]", "", ans).split()[0].strip()
-        return ans
+        after_hash = generated_text.split("####")[-1].strip()
+        cleaned = re.sub(r"[,$]", "", after_hash).strip()
+        tokens = cleaned.split()
+        if tokens:
+            return tokens[0].strip()
 
     # Priority 2: 'The answer is [number]'
-    match = re.search(r"(?:the\s+answer\s+is\s+|is\s+|equal\s+to\s+)([-+]?\d+(?:\.\d+)?)", generated_text, re.IGNORECASE)
+    match = re.search(
+        r"(?:the\s+answer\s+is\s+|is\s+|equal\s+to\s+)([-+]?\d+(?:\.\d+)?)",
+        generated_text,
+        re.IGNORECASE,
+    )
     if match:
         return match.group(1).replace(",", "").strip()
 
@@ -70,6 +78,11 @@ def parse_args():
         type=int,
         default=512,
         help="Maximum new tokens to generate per answer (default: 512)",
+    )
+    parser.add_argument(
+        "--show_outputs",
+        action="store_true",
+        help="Print model generation text, question, and answers to the terminal for test samples",
     )
     parser.add_argument(
         "--output_results",
@@ -125,7 +138,8 @@ def main():
     detailed_results = []
 
     print("\nRunning evaluation...")
-    for idx, rec in enumerate(records):
+    pbar = tqdm(records, desc="Evaluating", unit="sample")
+    for idx, rec in enumerate(pbar):
         prompt = rec["full_prompt"]
         gold_ans = str(rec["gold_answer"]).strip()
         depth = round(rec["needle_depth_ratio"], 2)
@@ -146,16 +160,31 @@ def main():
         if is_correct:
             depth_stats[depth]["correct"] += 1
 
+        # Display model generation output if requested, or for the first 2 samples as preview
+        if args.show_outputs or idx < 2:
+            status_str = "CORRECT ✓" if is_correct else "INCORRECT ✗"
+            preview_note = " (Preview - pass --show_outputs to display all)" if (not args.show_outputs and idx < 2) else ""
+            tqdm.write(
+                f"\n{'=' * 70}\n"
+                f"[Sample {idx + 1}/{len(records)} | Needle Depth: {depth:.2f} | {status_str}]{preview_note}\n"
+                f"Question:     {rec.get('query', '').strip()}\n"
+                f"Gold Answer:  {gold_ans}\n"
+                f"Predicted:    {pred_ans}\n"
+                f"Model Output:\n{gen_text.strip()}\n"
+                f"{'=' * 70}"
+            )
+
         detailed_results.append({
             "id": rec["id"],
             "depth": depth,
             "gold_answer": gold_ans,
             "pred_answer": pred_ans,
             "correct": is_correct,
+            "model_output": gen_text.strip(),
         })
 
-        if (idx + 1) % 10 == 0 or (idx + 1) == len(records):
-            print(f"  Processed {idx + 1}/{len(records)} | Overall Accuracy: {total_correct / (idx + 1) * 100:.1f}%")
+        if not args.show_outputs and ((idx + 1) % 10 == 0 or (idx + 1) == len(records)):
+            tqdm.write(f"  Processed {idx + 1}/{len(records)} | Overall Accuracy: {total_correct / (idx + 1) * 100:.1f}%")
 
     # 4. Summary report
     overall_acc = (total_correct / len(records) * 100) if records else 0.0

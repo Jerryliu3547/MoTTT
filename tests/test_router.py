@@ -85,3 +85,49 @@ def test_asymmetric_balancing_loss_uniform_minimum():
 
     # Collapsed loss should be substantially higher than balanced loss
     assert collapsed_loss > balanced_loss * 2.0
+
+
+def test_layer_level_router_and_loss():
+    batch_size = 2
+    seq_len = 8
+    hidden_dim = 64
+    num_reasoning_experts = 4
+    num_layers = 24
+    total_experts = 1 + num_reasoning_experts
+
+    router = QueryAwareRouter(
+        hidden_dim=hidden_dim,
+        num_reasoning_experts=num_reasoning_experts,
+        num_layers=num_layers,
+    )
+
+    token_hidden_states = torch.randn(batch_size, seq_len, hidden_dim)
+    query_embedding = torch.randn(batch_size, hidden_dim)
+
+    gates, logits = router(token_hidden_states, query_embedding)
+
+    assert gates.shape == (batch_size, seq_len, num_layers, total_experts)
+    assert logits.shape == (batch_size, seq_len, num_layers, total_experts)
+
+    # Every layer's gates must sum to 1.0 along the expert dimension
+    sums = torch.sum(gates, dim=-1)
+    assert torch.allclose(sums, torch.ones_like(sums), atol=1e-5)
+
+    # Test AsymmetricBalancingLoss across all layers
+    loss_fn = AsymmetricBalancingLoss(
+        num_reasoning_experts=num_reasoning_experts,
+        num_layers=num_layers,
+        lambda_bal=0.01,
+    )
+    logits.retain_grad()
+    dummy_loss = loss_fn(logits)
+    dummy_loss.backward()
+
+    assert logits.grad is not None
+    # Dynamic Scratchpad (dim=-1 index 0) must have ZERO gradient across all 24 layers
+    pad_grad = logits.grad[..., 0]
+    assert torch.allclose(pad_grad, torch.zeros_like(pad_grad), atol=1e-7)
+    # Reasoning experts (dim=-1 indices 1..4) should have non-zero gradients
+    exp_grad = logits.grad[..., 1:]
+    assert not torch.allclose(exp_grad, torch.zeros_like(exp_grad), atol=1e-7)
+

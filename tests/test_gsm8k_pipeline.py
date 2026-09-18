@@ -135,3 +135,30 @@ def test_random_depth_selection():
         for rec in loaded_train:
             assert rec["needle_depth_ratio"] in [0.2, 0.5, 0.8]
 
+
+def test_extract_predicted_answer_edge_cases():
+    """Verify that extract_predicted_answer never raises IndexError and extracts correctly."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "experiments" / "gsm8k"))
+    from model_test import extract_predicted_answer
+
+    # Edge Case 1: Trailing #### with only whitespace or empty
+    assert extract_predicted_answer("The final answer is ####") == ""
+    assert extract_predicted_answer("Step 1: 5 + 5 = 10\n####   \n") == "10"
+    assert extract_predicted_answer("#### $,") == ""
+
+    # Edge Case 2: Standard #### answer with currency/commas
+    assert extract_predicted_answer("#### $1,400\nExtra text") == "1400"
+    assert extract_predicted_answer("The answer is #### 42") == "42"
+
+    # Edge Case 3: 'The answer is' pattern without ####
+    assert extract_predicted_answer("Therefore, the answer is 250.") == "250"
+    assert extract_predicted_answer("So it is equal to 99") == "99"
+
+    # Edge Case 4: No pattern, fallback to last number
+    assert extract_predicted_answer("He had 5 apples then bought 7 more so he has 12") == "12"
+
+    # Edge Case 5: No numbers at all
+    assert extract_predicted_answer("No solution found") == ""
+

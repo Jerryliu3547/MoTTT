@@ -697,11 +697,13 @@ For each test example:
 
     # Cell 14: Test-time eval Code
     add_code("""def extract_predicted_answer(text: str) -> str:
-    \"\"\"Extract numeric answer from model generation.\"\"\"
+    \"\"\"Extract numeric answer from model generation safely.\"\"\"
     if "####" in text:
-        ans = text.split("####")[-1].strip()
-        ans = re.sub(r"[,$]", "", ans).split()[0].strip()
-        return ans
+        after_hash = text.split("####")[-1].strip()
+        cleaned = re.sub(r"[,$]", "", after_hash).strip()
+        tokens = cleaned.split()
+        if tokens:
+            return tokens[0].strip()
     match = re.search(r"(?:the\\s+answer\\s+is\\s+|is\\s+|equal\\s+to\\s+)([-+]?\\d+(?:\\.\\d+)?)", text, re.IGNORECASE)
     if match:
         return match.group(1).replace(",", "").strip()
@@ -716,11 +718,16 @@ if not USE_MOCK and base_llm is not None and tokenizer is not None:
         if hasattr(base_llm, "generation_config") and base_llm.generation_config is not None:
             base_llm.generation_config.max_length = None
             base_llm.generation_config.max_new_tokens = MAX_NEW_TOKENS
+        if hasattr(base_llm, "config") and base_llm.config is not None:
+            base_llm.config.max_length = None
         hf_pipeline_gen = hf_pipeline(
             "text-generation",
             model=base_llm,
             tokenizer=tokenizer,
         )
+        if hasattr(hf_pipeline_gen.model, "generation_config") and hf_pipeline_gen.model.generation_config is not None:
+            hf_pipeline_gen.model.generation_config.max_length = None
+            hf_pipeline_gen.model.generation_config.max_new_tokens = MAX_NEW_TOKENS
         print("Initialized Hugging Face text-generation pipeline.")
     except Exception as e:
         print(f"Could not initialize text-generation pipeline: {e}")
@@ -769,6 +776,9 @@ if exp_weights.exists():
             expert.load_state_dict(state)
         print(f"Loaded {len(saved_experts)} reasoning experts from {exp_weights}")
 
+if not USE_MOCK and base_llm is not None:
+    eval_model = eval_model.to(DEVICE, dtype=torch_dtype)
+
 eval_model.eval()
 eval_inner_opt = torch.optim.SGD(eval_model.get_scratchpad_parameters(), lr=INNER_LR)
 
@@ -810,10 +820,6 @@ for idx, rec in enumerate(pbar):
             q_emb = base_llm.model.embed_tokens(q_enc.input_ids).mean(dim=1)
             gates, logits = eval_model.router(q_emb.unsqueeze(1), q_emb)
         eval_model.set_routing_gates(gates)
-
-        avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
-        scratchpad_weight = float(avg_gates[0])
-        reasoning_weights = [float(w) for w in avg_gates[1:]]
     else:
         dummy_chunk = torch.randn(4, HIDDEN_DIM, device=DEVICE)
         for _ in range(INNER_STEPS):
@@ -828,9 +834,18 @@ for idx, rec in enumerate(pbar):
             h_state = torch.randn(1, 8, HIDDEN_DIM, device=DEVICE)
             blended, gates, logits = eval_model(h_state, q_emb)
 
-            avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
-            scratchpad_weight = float(avg_gates[0])
-            reasoning_weights = [float(w) for w in avg_gates[1:]]
+    # Gate statistics extraction (supports layer-level gates [..., num_layers, 1 + E] and global gates)
+    if gates.dim() >= 3 and gates.shape[-2] > 1:
+        lg = gates.squeeze(0) if gates.shape[0] == 1 else gates
+        if lg.dim() == 3:
+            lg = lg.mean(dim=0)
+        scratchpad_per_layer = lg[:, 0].cpu().tolist()
+        scratchpad_weight = float(sum(scratchpad_per_layer) / len(scratchpad_per_layer))
+        reasoning_weights = lg[:, 1:].mean(dim=0).cpu().tolist()
+    else:
+        avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
+        scratchpad_weight = float(avg_gates[0])
+        reasoning_weights = [float(w) for w in avg_gates[1:]]
 
     gate_stats["scratchpad"].append(scratchpad_weight)
     gate_stats["reasoning_mean"].append(sum(reasoning_weights) / len(reasoning_weights))
