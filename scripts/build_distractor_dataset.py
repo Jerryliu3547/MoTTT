@@ -2,9 +2,10 @@
 """CLI script to build and export distractor-injected GSM8K datasets for MoTTT and external baseline models."""
 
 import argparse
+import random
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from mottt.data.gsm8k_loader import load_gsm8k_dataset
 from mottt.data.distractor_generator import (
@@ -36,7 +37,31 @@ def parse_args():
         "--depth_ratios",
         type=str,
         default="0.1,0.3,0.5,0.7,0.9",
-        help="Comma-separated needle depth ratios delta in [0.1, 0.9] (default: 0.1,0.3,0.5,0.7,0.9)",
+        help="Comma-separated needle depth ratios delta in [0.1, 0.9] or 'random' (default: 0.1,0.3,0.5,0.7,0.9)",
+    )
+    parser.add_argument(
+        "--random_depth",
+        action="store_true",
+        help="Randomly select a single depth ratio per example instead of all specified ratios (ideal for train split)",
+    )
+    parser.add_argument(
+        "--random_mode",
+        type=str,
+        default="choice",
+        choices=["choice", "uniform"],
+        help="Random sampling mode: 'choice' selects randomly from --depth_ratios, 'uniform' samples uniformly in --depth_range (default: choice)",
+    )
+    parser.add_argument(
+        "--depth_range",
+        type=str,
+        default="0.1,0.9",
+        help="Min and max bounds for uniform random depth sampling (default: 0.1,0.9)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible depth selection (default: 42)",
     )
     parser.add_argument(
         "--target_context_tokens",
@@ -66,14 +91,30 @@ def parse_args():
 
 def main():
     args = parse_args()
-    depth_ratios: List[float] = [float(d.strip()) for d in args.depth_ratios.split(",")]
+    random.seed(args.seed)
+
+    is_random = args.random_depth or (args.depth_ratios.strip().lower() == "random")
+    if args.depth_ratios.strip().lower() == "random":
+        depth_ratios = [0.1, 0.3, 0.5, 0.7, 0.9]
+    else:
+        depth_ratios = [float(d.strip()) for d in args.depth_ratios.split(",")]
+
+    bounds = [float(x.strip()) for x in args.depth_range.split(",")]
+    min_bound, max_bound = min(bounds), max(bounds)
 
     print("=" * 70)
     print("MoTTT: Distractor-Injected Long-Context GSM8K Generator")
     print("=" * 70)
     print(f"Split:                {args.split}")
     print(f"Max Samples:          {args.max_samples if args.max_samples is not None else 'All'}")
-    print(f"Depth Ratios:         {depth_ratios}")
+    if is_random:
+        print(f"Depth Selection:      RANDOM (mode: {args.random_mode}, seed: {args.seed})")
+        if args.random_mode == "uniform":
+            print(f"Depth Range:          [{min_bound}, {max_bound}]")
+        else:
+            print(f"Depth Candidates:     {depth_ratios}")
+    else:
+        print(f"Depth Ratios:         {depth_ratios}")
     print(f"Context Tokens:       {args.target_context_tokens}")
     print(f"Output Directory:     {args.output_dir}")
     print("=" * 70)
@@ -100,7 +141,15 @@ def main():
             gold_answer=ex.gold_answer,
         )
 
-        for depth in depth_ratios:
+        if is_random:
+            if args.random_mode == "uniform":
+                chosen_depths = [round(random.uniform(min_bound, max_bound), 2)]
+            else:
+                chosen_depths = [random.choice(depth_ratios)]
+        else:
+            chosen_depths = depth_ratios
+
+        for depth in chosen_depths:
             rec = synthesizer.create_record(
                 example_id=ex.example_id,
                 original_question=ex.question,

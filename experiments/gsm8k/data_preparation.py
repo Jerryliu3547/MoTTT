@@ -2,9 +2,10 @@
 """Data preparation script for GSM8K distractor-injected long-context experiment."""
 
 import argparse
+import random
 import sys
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 from mottt.data.gsm8k_loader import GSM8KExample, load_gsm8k_dataset
 from mottt.data.distractor_generator import (
@@ -13,6 +14,7 @@ from mottt.data.distractor_generator import (
     LongContextGSM8KRecord,
 )
 from mottt.data.dataset_exporter import export_records_to_jsonl, export_dataset_bundle
+
 
 
 MOCK_GSM8K_SAMPLES = [
@@ -84,6 +86,24 @@ def parse_args():
         action="store_true",
         help="Use mock GSM8K examples offline without calling Hugging Face",
     )
+    parser.add_argument(
+        "--random_train_depth",
+        action="store_true",
+        help="Randomly select a single depth ratio per training example instead of duplicating across all ratios",
+    )
+    parser.add_argument(
+        "--random_mode",
+        type=str,
+        default="choice",
+        choices=["choice", "uniform"],
+        help="Random depth mode: 'choice' selects randomly from --depth_ratios, 'uniform' samples uniformly in [0.1, 0.9] (default: choice)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducible depth selection (default: 42)",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +113,9 @@ def process_split(
     depth_ratios: List[float],
     target_context_tokens: int,
     chunk_size: int,
+    random_depth: bool = False,
+    random_mode: str = "choice",
+    depth_range: Tuple[float, float] = (0.1, 0.9),
 ) -> List[LongContextGSM8KRecord]:
     synthesizer = DistractorNeedleSynthesizer(chunk_size=chunk_size)
     records: List[LongContextGSM8KRecord] = []
@@ -104,7 +127,15 @@ def process_split(
             gold_answer=ex.gold_answer,
         )
 
-        for depth in depth_ratios:
+        if random_depth:
+            if random_mode == "uniform":
+                chosen_depths = [round(random.uniform(depth_range[0], depth_range[1]), 2)]
+            else:
+                chosen_depths = [random.choice(depth_ratios)]
+        else:
+            chosen_depths = depth_ratios
+
+        for depth in chosen_depths:
             rec = synthesizer.create_record(
                 example_id=ex.example_id,
                 original_question=ex.question,
@@ -122,6 +153,7 @@ def process_split(
 
 def main():
     args = parse_args()
+    random.seed(args.seed)
     depth_ratios: List[float] = [float(d.strip()) for d in args.depth_ratios.split(",")]
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -133,6 +165,7 @@ def main():
     print(f"Target Context:       {args.target_context_tokens} tokens")
     print(f"Chunk Size (K):       {args.chunk_size}")
     print(f"Depth Ratios:         {depth_ratios}")
+    print(f"Random Train Depth:   {args.random_train_depth} (mode: {args.random_mode}, seed: {args.seed})")
     print(f"Mock Mode:            {args.mock}")
     print("=" * 70)
 
@@ -174,6 +207,8 @@ def main():
         depth_ratios=depth_ratios,
         target_context_tokens=args.target_context_tokens,
         chunk_size=args.chunk_size,
+        random_depth=args.random_train_depth,
+        random_mode=args.random_mode,
     )
     train_file = out_dir / "train_distractor.jsonl"
     export_records_to_jsonl(train_records, str(train_file))

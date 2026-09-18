@@ -58,12 +58,21 @@ MoTTT provides an automated data pipeline using Hugging Face's `openai/gsm8k` da
 ```bash
 conda activate mottt
 
-# Generate distractor dataset (e.g. for test split)
+# Generate distractor dataset (e.g. for test split with fixed grid)
 python scripts/build_distractor_dataset.py \
     --split test \
     --depth_ratios 0.1,0.3,0.5,0.7,0.9 \
     --target_context_tokens 4096 \
     --output_dir data/gsm8k_distractor
+
+# Or generate training dataset with random depth per example (prevents 5x dataset inflation):
+python scripts/build_distractor_dataset.py \
+    --split train \
+    --random_depth \
+    --random_mode choice \
+    --depth_ratios 0.1,0.3,0.5,0.7,0.9 \
+    --target_context_tokens 4096 \
+    --output_dir data/gsm8k_distractor_train
 ```
 
 ### Evaluating Other Baseline Models on the Benchmark

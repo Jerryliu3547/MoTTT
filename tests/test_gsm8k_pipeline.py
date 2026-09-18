@@ -108,3 +108,30 @@ def test_distractor_record_creation_and_export():
         assert loaded[1]["id"] == r.id
         assert loaded[1]["gold_answer"] == "9876"
         assert loaded[1]["query"] == query
+
+
+def test_random_depth_selection():
+    import subprocess
+    import sys
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cmd = [
+            sys.executable,
+            "experiments/gsm8k/data_preparation.py",
+            "--mock",
+            "--random_train_depth",
+            "--target_context_tokens", "128",
+            "--chunk_size", "32",
+            "--depth_ratios", "0.2,0.5,0.8",
+            "--output_dir", str(tmpdir),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        assert res.returncode == 0, f"Error:\n{res.stderr}"
+
+        # In mock mode, 2 train examples. With --random_train_depth, exactly 2 records should be generated
+        train_file = Path(tmpdir) / "train_distractor.jsonl"
+        assert train_file.exists()
+        loaded_train = load_distractor_jsonl(str(train_file))
+        assert len(loaded_train) == 2
+        for rec in loaded_train:
+            assert rec["needle_depth_ratio"] in [0.2, 0.5, 0.8]
+
