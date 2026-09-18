@@ -3,9 +3,9 @@
 Implementation of **MoTTT** as specified in [ideas.md](ideas.md).
 
 MoTTT decouples factual ingestion / episodic memory from multi-step domain reasoning:
-1. **Dynamic Memory Scratchpad (Test-Time LoRA $\mathcal{C}=\{0\}$)**: Adapts dynamically via NLL on chunked long contexts ($K=256$, unit scaling $\gamma = \alpha / r = 1.0$).
-2. **Pre-trained LoRA Reasoning Experts ($\mathcal{R}=\{1 \dots E\}$)**: Specialized in multi-step reasoning.
-3. **Query-Aware MLP Router with Asymmetric Load Balancing**: Protects reasoning experts from collapse while freeing the scratchpad from artificial quotas.
+1. **Dynamic Memory Scratchpad (Test-Time LoRA $\mathcal{C}=\{0\}$)**: Injected across all linear projections (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) of the transformer backbone, adapting dynamically via NLL on chunked long contexts ($K=256$, unit scaling $\gamma = \alpha / r = 1.0$).
+2. **Pre-trained LoRA Reasoning Experts ($\mathcal{R}=\{1 \dots E\}$)**: Injected alongside the scratchpad across all linear modules, specialized in multi-step reasoning.
+3. **Query-Aware MLP Router with Asymmetric Load Balancing**: Protects reasoning experts from collapse while freeing the scratchpad from artificial quotas. All-linear `MoLoRALinear` layers receive router gates dynamically for query-aware blended computation.
 
 ---
 
@@ -105,14 +105,15 @@ python experiments/gsm8k/data_preparation.py --depth_ratios 0.1,0.3,0.5,0.7,0.9 
 
 # 2. Train MoTTT with Qwen2.5-0.5B and Query-Aware Router
 python experiments/gsm8k/model_train.py \
-    --data_path experiments/gsm8k/data/train_distractor.jsonl \
+    --data_path data/gsm8k_distractor_train/gsm8k_distractor_all.jsonl \
     --base_model_name Qwen/Qwen2.5-0.5B \
     --output_dir experiments/gsm8k/checkpoints \
-    --epochs 3
+    --batch_size 4 \
+    --epochs 1
 
 # 3. Test model: inner-loop scratchpad adaptation & depth evaluation
 python experiments/gsm8k/model_test.py \
-    --test_data experiments/gsm8k/data/test_distractor.jsonl \
+    --test_data data/gsm8k_distractor_test/gsm8k_distractor_all.jsonl \
     --checkpoint_dir experiments/gsm8k/checkpoints \
     --output_dir experiments/gsm8k/results
 
@@ -132,7 +133,7 @@ All local tests run against lightweight synthetic tensors and mock modules witho
 ```bash
 conda activate mottt
 
-# Run unit tests (13 tests covering router, loss, scratchpad, GSM8K, and experiment cycles)
+# Run unit tests (16 tests covering router, loss, scratchpad, GSM8K, all-linear MoLoRA, and experiment cycles)
 pytest tests/ -v
 
 # Run smoke test script

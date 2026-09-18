@@ -66,6 +66,12 @@ def parse_args():
         help="Run in mock mode (simulates model inference without GPU/model download)",
     )
     parser.add_argument(
+        "--max_new_tokens",
+        type=int,
+        default=512,
+        help="Maximum new tokens to generate per answer (default: 512)",
+    )
+    parser.add_argument(
         "--output_results",
         type=str,
         default=None,
@@ -104,6 +110,9 @@ def main():
                 device_map="auto" if torch.cuda.is_available() else None,
                 trust_remote_code=True,
             )
+            if hasattr(model, "generation_config") and model.generation_config is not None:
+                model.generation_config.max_length = None
+                model.generation_config.max_new_tokens = args.max_new_tokens
             pipeline = hf_pipeline("text-generation", model=model, tokenizer=tokenizer, device=device)
         except Exception as e:
             print(f"Failed to load model {args.model_name_or_path}: {e}", file=sys.stderr)
@@ -126,7 +135,7 @@ def main():
             pred_ans = gold_ans if (idx % 2 == 0) else "0"
             gen_text = f"Step 1: ... #### {pred_ans}"
         else:
-            outputs = pipeline(prompt, max_new_tokens=256, do_sample=False)
+            outputs = pipeline(prompt, max_new_tokens=args.max_new_tokens, do_sample=False)
             gen_text = outputs[0]["generated_text"][len(prompt):]
             pred_ans = extract_predicted_answer(gen_text)
 

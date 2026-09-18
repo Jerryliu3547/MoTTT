@@ -6,6 +6,7 @@ import random
 import sys
 from pathlib import Path
 from typing import List, Tuple
+from tqdm import tqdm
 
 # Ensure src/ is on sys.path even if not installed via pip install -e .
 SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
@@ -125,7 +126,8 @@ def process_split(
     synthesizer = DistractorNeedleSynthesizer(chunk_size=chunk_size)
     records: List[LongContextGSM8KRecord] = []
 
-    for ex in examples:
+    pbar = tqdm(examples, desc=f"Synthesizing {split_name} split", unit="problem")
+    for ex in pbar:
         decomposed = PremiseQueryDecomposer.decompose(
             problem_text=ex.question,
             solution_text=ex.solution,

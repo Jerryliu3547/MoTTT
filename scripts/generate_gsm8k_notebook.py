@@ -64,6 +64,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import pandas as pd
 
@@ -84,6 +85,7 @@ print(f"CUDA Available: {torch.cuda.is_available()}")
 
 # Import MoTTT modules
 from mottt.models.mottt_model import MoTTTModel
+from mottt.models.molora import MoLoRALinear, inject_molora_to_model
 from mottt.models.router import QueryAwareRouter, AsymmetricBalancingLoss
 from mottt.models.scratchpad import TestTimeScratchpadLoRA, LoRALinear
 from mottt.data.gsm8k_loader import GSM8KExample, load_gsm8k_dataset
@@ -140,9 +142,10 @@ EPOCHS = 3
 LR = 1e-4
 BATCH_SIZE = 4
 
-# Test-Time Inner Loop Hyperparameters
+# Test-Time Inner Loop & Generation Hyperparameters
 INNER_LR = 1e-3
 INNER_STEPS = 1
+MAX_NEW_TOKENS = 512
 
 # Setup Directory Structure
 OUTPUT_BASE = project_root / "experiments" / "gsm8k"
@@ -286,9 +289,9 @@ The MoTTT architecture consists of:
 We optimize the router and reasoning experts using **AdamW**.""")
 
     # Cell 8: Model Init Code
-    add_code("""# Define PyTorch Dataset
+    add_code("""# Define PyTorch Dataset for both Mock and Tokenized Training
 class GSM8KTrainDataset(Dataset):
-    def __init__(self, records: List[Dict], hidden_dim: int, is_mock: bool = False):
+    def __init__(self, records: List[Dict], hidden_dim: int = 896, is_mock: bool = False):
         self.records = records
         self.hidden_dim = hidden_dim
         self.is_mock = is_mock
@@ -296,21 +299,120 @@ class GSM8KTrainDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
         rec = self.records[idx]
-        seq_len = 16
-        hidden_states = torch.randn(seq_len, self.hidden_dim)
-        query_embedding = torch.randn(self.hidden_dim)
-        target_labels = torch.randint(0, 100, (seq_len,))
+        if self.is_mock:
+            seq_len = 16
+            return {
+                "hidden_states": torch.randn(seq_len, self.hidden_dim),
+                "query_embedding": torch.randn(self.hidden_dim),
+                "context_states": torch.randn(4, self.hidden_dim),
+                "target_labels": torch.randint(0, 100, (seq_len,)),
+                "id": rec.get("id", f"sample_{idx}"),
+            }
+        # In full GPU mode, return raw record for dynamic batch tokenization
+        return rec
+
+
+def make_collate_fn(tokenizer, max_length: int = 512, max_context_length: int = 256):
+    \"\"\"Collate function to dynamically tokenize queries, solutions, and contexts.\"\"\"
+    def collate_fn(batch_records: List[Dict]) -> Dict[str, Any]:
+        queries = [r.get("query", "") for r in batch_records]
+        solutions = [r.get("solution", "") for r in batch_records]
+        contexts = [r.get("distractor_context", "")[:1500] for r in batch_records]
+
+        prompts = [f"Question:\\n{q}\\n\\nSolution:" for q in queries]
+        full_texts = [f"{p} {s}" for p, s in zip(prompts, solutions)]
+
+        ctx_enc = tokenizer(
+            contexts,
+            max_length=max_context_length,
+            truncation=True,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        full_enc = tokenizer(
+            full_texts,
+            max_length=max_length,
+            truncation=True,
+            padding=True,
+            return_tensors="pt",
+        )
+
+        labels = full_enc.input_ids.clone()
+        prompt_lens = []
+        for i, p in enumerate(prompts):
+            p_len = len(tokenizer.encode(p, add_special_tokens=False))
+            prompt_lens.append(p_len)
+            labels[i, :p_len] = -100
+
+        pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        labels[labels == pad_token_id] = -100
+
         return {
-            "hidden_states": hidden_states,
-            "query_embedding": query_embedding,
-            "target_labels": target_labels,
-            "id": rec.get("id", f"sample_{idx}"),
+            "ctx_input_ids": ctx_enc.input_ids,
+            "ctx_attention_mask": ctx_enc.attention_mask,
+            "input_ids": full_enc.input_ids,
+            "attention_mask": full_enc.attention_mask,
+            "labels": labels,
+            "prompt_lens": prompt_lens,
+            "ids": [r.get("id", "") for r in batch_records],
         }
 
+    return collate_fn
+
+
+# Load Hugging Face Backbone if running in GPU mode
+base_llm = None
+tokenizer = None
+collate_fn = None
+torch_dtype = torch.float32
+
+if not USE_MOCK:
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        print(f"Loading base LLM and tokenizer: {BASE_MODEL_NAME}...")
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        torch_dtype = (
+            torch.bfloat16
+            if (torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+            else (torch.float16 if torch.cuda.is_available() else torch.float32)
+        )
+        base_llm = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL_NAME,
+            torch_dtype=torch_dtype,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+        )
+        base_llm.eval()
+        for p in base_llm.parameters():
+            p.requires_grad = False
+
+        HIDDEN_DIM = base_llm.config.hidden_size
+        collate_fn = make_collate_fn(tokenizer)
+        print(f"Base LLM loaded (hidden_dim={HIDDEN_DIM}, dtype={torch_dtype}).")
+    except Exception as e:
+        print(f"Notice: Could not load Hugging Face model {BASE_MODEL_NAME}: {e}")
+        print("Falling back to simulated CPU mock backbone.")
+        USE_MOCK = True
+        HIDDEN_DIM = 64
+
 # Instantiate MoTTT Model
-base_backbone = nn.Linear(HIDDEN_DIM, HIDDEN_DIM) if USE_MOCK else nn.Identity()
+if USE_MOCK:
+    class MockBackbone(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.q_proj = nn.Linear(dim, dim)
+        def forward(self, x):
+            return self.q_proj(x)
+    base_backbone = MockBackbone(HIDDEN_DIM)
+else:
+    base_backbone = base_llm
+
 model = MoTTTModel(
     hidden_dim=HIDDEN_DIM,
     num_reasoning_experts=NUM_EXPERTS,
@@ -318,25 +420,37 @@ model = MoTTTModel(
     alpha=ALPHA,
     lambda_bal=LAMBDA_BAL,
     base_backbone=base_backbone,
+    all_linear=True,
 ).to(DEVICE)
+
+if not USE_MOCK and base_llm is not None:
+    model = model.to(DEVICE, dtype=torch_dtype)
 
 # Set up AdamW optimizer targeting router and reasoning experts
 trainable_params = list(model.router.parameters())
-for expert in model.reasoning_experts:
-    trainable_params.extend(list(expert.parameters()))
+trainable_params.extend(model.get_reasoning_parameters())
 
 optimizer = torch.optim.AdamW(trainable_params, lr=LR, weight_decay=0.01)
 
+# Inner-loop optimizer for dynamic scratchpad LoRA
+inner_params = model.get_scratchpad_parameters()
+inner_opt = torch.optim.SGD(inner_params, lr=INNER_LR)
+
 # Task head and loss function
-head = nn.Linear(HIDDEN_DIM, 100).to(DEVICE)
-loss_fn = nn.CrossEntropyLoss()
+if USE_MOCK:
+    head = nn.Linear(HIDDEN_DIM, 100).to(DEVICE)
+    loss_fn = nn.CrossEntropyLoss()
+else:
+    head = None
+    loss_fn = nn.CrossEntropyLoss(ignore_index=-100)
 
 # Parameter accounting
 router_params = sum(p.numel() for p in model.router.parameters() if p.requires_grad)
-expert_params = sum(sum(p.numel() for p in exp.parameters() if p.requires_grad) for exp in model.reasoning_experts)
-scratchpad_params = sum(p.numel() for p in model.scratchpad_lora.parameters())
+expert_params = sum(p.numel() for p in model.get_reasoning_parameters() if p.requires_grad)
+scratchpad_params = sum(p.numel() for p in model.get_scratchpad_parameters())
 
 print("Model Initialized Successfully:")
+print(f"  - Injected Linear Modules:        {len(model.injected_linear_names)} modules")
 print(f"  - Trainable Router Parameters:    {router_params:,}")
 print(f"  - Trainable Reasoning Parameters: {expert_params:,} across {NUM_EXPERTS} experts")
 print(f"  - Test-Time Scratchpad Parameters:{scratchpad_params:,} (dynamic)")""")
@@ -345,14 +459,14 @@ print(f"  - Test-Time Scratchpad Parameters:{scratchpad_params:,} (dynamic)")"""
     add_markdown(r"""## 4. Outer-Loop Training Pipeline
 
 We train the Query-Aware Router and reasoning experts on the distractor dataset.
-The asymmetric load balancing loss $\mathcal{L}_{\\text{bal}}$ ensures balanced utilization across reasoning experts while allowing the test-time scratchpad to be allocated on-demand:
-$$\mathcal{L}_{\\text{bal}} = \lambda_{\\text{bal}} \cdot E \\sum_{i=1}^E f_i P_i$$
+The asymmetric load balancing loss $\mathcal{L}_{\text{bal}}$ ensures balanced utilization across reasoning experts while allowing the test-time scratchpad to be allocated on-demand:
+$$\mathcal{L}_{\text{bal}} = \lambda_{\text{bal}} \cdot E \sum_{i=1}^E f_i P_i$$
 where $f_i$ is the fraction of tokens routed to reasoning expert $i$, and $P_i$ is the average routing probability for expert $i$.""")
 
     # Cell 10: Training Code
     add_code("""train_records_dict = load_distractor_jsonl(str(train_file))
 dataset = GSM8KTrainDataset(train_records_dict, hidden_dim=HIDDEN_DIM, is_mock=USE_MOCK)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
 
 print(f"Starting Training for {EPOCHS} Epochs ({len(dataloader)} batches/epoch)...\\n")
 
@@ -364,26 +478,98 @@ for epoch in range(1, EPOCHS + 1):
     total_task_loss = 0.0
     total_bal_loss = 0.0
 
-    for step, batch in enumerate(dataloader):
-        h = batch["hidden_states"].to(DEVICE)
-        q = batch["query_embedding"].to(DEVICE)
-        targets = batch["target_labels"].to(DEVICE)
+    pbar = tqdm(dataloader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch")
+    for step, batch in enumerate(pbar):
+        # -------------------------------------------------------------
+        # Step 1: Clear Scratchpad before processing each batch/question
+        # Guarantees zero episodic state leakage across questions
+        # -------------------------------------------------------------
+        model.reset_scratchpad()
 
-        optimizer.zero_grad()
+        if not USE_MOCK and base_llm is not None:
+            # Full GPU Tokenized Training Path
+            ctx_ids = batch["ctx_input_ids"].to(DEVICE)
+            ctx_mask = batch["ctx_attention_mask"].to(DEVICE)
+            input_ids = batch["input_ids"].to(DEVICE)
+            attention_mask = batch["attention_mask"].to(DEVICE)
+            labels = batch["labels"].to(DEVICE)
 
-        blended, gates, logits = model(h, q)
-        preds = head(blended)
+            # Inner-loop adaptation on context representations
+            model.set_routing_gates(None)
+            for _ in range(INNER_STEPS):
+                ctx_out = base_llm(input_ids=ctx_ids, attention_mask=ctx_mask)
+                ctx_logits = ctx_out.logits
+                shift_ctx_logits = ctx_logits[..., :-1, :].contiguous()
+                shift_ctx_labels = ctx_ids[..., 1:].contiguous()
+                inner_loss = F.cross_entropy(shift_ctx_logits.view(-1, base_llm.config.vocab_size), shift_ctx_labels.view(-1))
+                inner_opt.zero_grad()
+                inner_loss.backward()
+                inner_opt.step()
 
-        task_loss = loss_fn(preds.view(-1, preds.shape[-1]), targets.view(-1))
-        bal_loss = model.compute_auxiliary_loss(logits)
+            # Outer-loop forward pass on query + solution with Query-Aware Routing
+            with torch.no_grad():
+                token_embs = base_llm.model.embed_tokens(input_ids)
+            q_embs = []
+            for i, p_len in enumerate(batch["prompt_lens"]):
+                p_len_clamped = max(1, min(p_len, token_embs.shape[1]))
+                q_embs.append(token_embs[i, :p_len_clamped].mean(dim=0))
+            q = torch.stack(q_embs, dim=0)
 
-        outer_loss = task_loss + bal_loss
-        outer_loss.backward()
-        optimizer.step()
+            gates, logits = model.router(token_embs, q)
+            model.set_routing_gates(gates)
+
+            optimizer.zero_grad()
+            outputs = base_llm(input_ids=input_ids, attention_mask=attention_mask)
+            vocab_logits = outputs.logits
+
+            shift_logits = vocab_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            task_loss = loss_fn(shift_logits.view(-1, base_llm.config.vocab_size).float(), shift_labels.view(-1))
+            bal_loss = model.compute_auxiliary_loss(logits)
+
+            outer_loss = task_loss + bal_loss
+            outer_loss.backward()
+            optimizer.step()
+
+            model.reset_scratchpad()
+        else:
+            # Mock / CPU Verification Path
+            model.set_routing_gates(None)
+            ctx = batch["context_states"].to(DEVICE)
+            for _ in range(INNER_STEPS):
+                chunk_out = model.base_backbone(ctx)
+                inner_loss = F.mse_loss(chunk_out, torch.zeros_like(chunk_out))
+                inner_opt.zero_grad()
+                inner_loss.backward()
+                inner_opt.step()
+
+            optimizer.zero_grad()
+            h = batch["hidden_states"].to(DEVICE)
+            q = batch["query_embedding"].to(DEVICE)
+            targets = batch["target_labels"].to(DEVICE)
+
+            blended, gates, logits = model(h, q)
+            preds = head(blended)
+
+            task_loss = loss_fn(preds.view(-1, preds.shape[-1]), targets.view(-1))
+            bal_loss = model.compute_auxiliary_loss(logits)
+
+            outer_loss = task_loss + bal_loss
+            outer_loss.backward()
+            optimizer.step()
+
+            model.reset_scratchpad()
 
         total_epoch_loss += outer_loss.item()
         total_task_loss += task_loss.item()
         total_bal_loss += bal_loss.item()
+
+        pbar.set_postfix({
+            "loss": f"{outer_loss.item():.4f}",
+            "task": f"{task_loss.item():.4f}",
+            "bal": f"{bal_loss.item():.5f}",
+        })
 
     avg_loss = total_epoch_loss / len(dataloader)
     avg_task = total_task_loss / len(dataloader)
@@ -395,11 +581,24 @@ for epoch in range(1, EPOCHS + 1):
         "task_loss": avg_task,
         "balance_loss": avg_bal,
     })
-    print(f"Epoch {epoch:02d}/{EPOCHS:02d} | Outer Loss: {avg_loss:.4f} (Task: {avg_task:.4f}, Bal: {avg_bal:.6f})")
+    print(f"Epoch {epoch:02d}/{EPOCHS:02d} Complete | Outer Loss: {avg_loss:.4f} (Task: {avg_task:.4f}, Bal: {avg_bal:.6f})")
 
 # Save Checkpoints
 torch.save(model.router.state_dict(), CKPT_DIR / "mottt_router.pt")
-torch.save([exp.state_dict() for exp in model.reasoning_experts], CKPT_DIR / "reasoning_experts.pt")
+
+if model.injected_linear_names:
+    molora_states = {
+        name: {
+            "reasoning_lora_A": mod.reasoning_lora_A.state_dict(),
+            "reasoning_lora_B": mod.reasoning_lora_B.state_dict(),
+        }
+        for name, mod in model.base_backbone.named_modules()
+        if isinstance(mod, MoLoRALinear)
+    }
+    torch.save(molora_states, CKPT_DIR / "reasoning_experts.pt")
+    print(f"Saved {len(molora_states)} all-linear reasoning expert modules to {CKPT_DIR / 'reasoning_experts.pt'}")
+else:
+    torch.save([exp.state_dict() for exp in model.reasoning_experts], CKPT_DIR / "reasoning_experts.pt")
 
 config = {
     "base_model_name": BASE_MODEL_NAME,
@@ -461,8 +660,8 @@ For each test example:
 3. **Lost-in-the-Middle Benchmark**: We record accuracy across needle depth ratios $\delta \in [0.1, 0.9]$.""")
 
     # Cell 14: Test-time eval Code
-    add_code("""def extract_answer(text: str) -> str:
-    \"\"\"Extract numeric answer from solution or model generation.\"\"\"
+    add_code("""def extract_predicted_answer(text: str) -> str:
+    \"\"\"Extract numeric answer from model generation.\"\"\"
     if "####" in text:
         ans = text.split("####")[-1].strip()
         ans = re.sub(r"[,$]", "", ans).split()[0].strip()
@@ -473,21 +672,69 @@ For each test example:
     numbers = re.findall(r"[-+]?\\d+(?:\\.\\d+)?", text)
     return numbers[-1].replace(",", "").strip() if numbers else ""
 
+# Optional: Generation pipeline for real model
+hf_pipeline_gen = None
+if not USE_MOCK and base_llm is not None and tokenizer is not None:
+    try:
+        from transformers import pipeline as hf_pipeline
+        if hasattr(base_llm, "generation_config") and base_llm.generation_config is not None:
+            base_llm.generation_config.max_length = None
+            base_llm.generation_config.max_new_tokens = MAX_NEW_TOKENS
+        hf_pipeline_gen = hf_pipeline(
+            "text-generation",
+            model=base_llm,
+            tokenizer=tokenizer,
+        )
+        print("Initialized Hugging Face text-generation pipeline.")
+    except Exception as e:
+        print(f"Could not initialize text-generation pipeline: {e}")
+
 # Load checkpoint into evaluation model
+if USE_MOCK:
+    class MockBackbone(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.q_proj = nn.Linear(dim, dim)
+        def forward(self, x):
+            return self.q_proj(x)
+    eval_backbone = MockBackbone(HIDDEN_DIM)
+else:
+    eval_backbone = base_llm
+
 eval_model = MoTTTModel(
     hidden_dim=HIDDEN_DIM,
     num_reasoning_experts=NUM_EXPERTS,
     rank=RANK,
     alpha=ALPHA,
-    base_backbone=base_backbone,
+    base_backbone=eval_backbone,
+    all_linear=True,
 ).to(DEVICE)
 
-eval_model.router.load_state_dict(torch.load(CKPT_DIR / "mottt_router.pt", map_location=DEVICE))
-expert_states = torch.load(CKPT_DIR / "reasoning_experts.pt", map_location=DEVICE)
-for expert, state in zip(eval_model.reasoning_experts, expert_states):
-    expert.load_state_dict(state)
+if not USE_MOCK and base_llm is not None:
+    eval_model = eval_model.to(DEVICE, dtype=torch_dtype)
+
+router_weights = CKPT_DIR / "mottt_router.pt"
+if router_weights.exists():
+    eval_model.router.load_state_dict(torch.load(router_weights, map_location=DEVICE))
+
+exp_weights = CKPT_DIR / "reasoning_experts.pt"
+if exp_weights.exists():
+    saved_experts = torch.load(exp_weights, map_location=DEVICE)
+    if isinstance(saved_experts, dict) and eval_model.injected_linear_names:
+        loaded_count = 0
+        for name, mod in eval_model.base_backbone.named_modules():
+            if isinstance(mod, MoLoRALinear) and name in saved_experts:
+                mod.reasoning_lora_A.load_state_dict(saved_experts[name]["reasoning_lora_A"])
+                mod.reasoning_lora_B.load_state_dict(saved_experts[name]["reasoning_lora_B"])
+                loaded_count += 1
+        print(f"Loaded {loaded_count} all-linear reasoning expert modules from {exp_weights}")
+    elif isinstance(saved_experts, list):
+        for expert, state in zip(eval_model.reasoning_experts, saved_experts):
+            expert.load_state_dict(state)
+        print(f"Loaded {len(saved_experts)} reasoning experts from {exp_weights}")
 
 eval_model.eval()
+eval_inner_opt = torch.optim.SGD(eval_model.get_scratchpad_parameters(), lr=INNER_LR)
 
 # Load test records
 test_records_list = load_distractor_jsonl(str(test_file))
@@ -498,42 +745,87 @@ total_correct = 0
 
 print(f"Beginning evaluation on {len(test_records_list)} test records across {len(DEPTH_RATIOS)} depths...\\n")
 
-for idx, rec in enumerate(test_records_list):
+pbar = tqdm(test_records_list, desc="Evaluating Test Records", unit="example")
+for idx, rec in enumerate(pbar):
     gold_ans = str(rec.get("gold_answer", "")).strip()
     depth = round(float(rec.get("needle_depth_ratio", 0.5)), 2)
 
-    # 1. Inner-loop Scratchpad Adaptation on context tokens
+    # 1. Clear scratchpad & Inner-loop Scratchpad Adaptation on context tokens
     eval_model.reset_scratchpad()
-    inner_opt = torch.optim.SGD(
-        [eval_model.scratchpad_lora.lora_A, eval_model.scratchpad_lora.lora_B],
-        lr=INNER_LR,
-    )
-    dummy_tokens = torch.randn(4, HIDDEN_DIM, device=DEVICE)
-    chunk_out = eval_model.scratchpad_lora(dummy_tokens)
-    inner_loss = F.mse_loss(chunk_out, torch.zeros_like(chunk_out))
-    inner_opt.zero_grad()
-    inner_loss.backward()
-    inner_opt.step()
+    eval_model.set_routing_gates(None)
 
-    # 2. Query-Aware Forward Pass
-    with torch.no_grad():
-        q_emb = torch.randn(1, HIDDEN_DIM, device=DEVICE)
-        h_state = torch.randn(1, 8, HIDDEN_DIM, device=DEVICE)
-        blended, gates, logits = eval_model(h_state, q_emb)
+    if not USE_MOCK and base_llm is not None and tokenizer is not None:
+        ctx_text = rec.get("distractor_context", "")[:1500]
+        ctx_enc = tokenizer(ctx_text, truncation=True, max_length=256, return_tensors="pt").to(DEVICE)
+        for _ in range(INNER_STEPS):
+            ctx_out = base_llm(input_ids=ctx_enc.input_ids, attention_mask=ctx_enc.attention_mask)
+            ctx_logits = ctx_out.logits
+            shift_logits = ctx_logits[..., :-1, :].contiguous()
+            shift_labels = ctx_enc.input_ids[..., 1:].contiguous()
+            inner_loss = F.cross_entropy(shift_logits.view(-1, base_llm.config.vocab_size), shift_labels.view(-1))
+            eval_inner_opt.zero_grad()
+            inner_loss.backward()
+            eval_inner_opt.step()
+
+        # Query-Aware Routing gates
+        q_text = rec.get("query", "")
+        q_enc = tokenizer(q_text, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            q_emb = base_llm.model.embed_tokens(q_enc.input_ids).mean(dim=1)
+            gates, logits = eval_model.router(q_emb.unsqueeze(1), q_emb)
+        eval_model.set_routing_gates(gates)
 
         avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
         scratchpad_weight = float(avg_gates[0])
         reasoning_weights = [float(w) for w in avg_gates[1:]]
-
-        gate_stats["scratchpad"].append(scratchpad_weight)
-        gate_stats["reasoning_mean"].append(np.mean(reasoning_weights))
-
-    # 3. Answer Prediction
-    if USE_MOCK:
-        # In mock mode, high accuracy with controlled variation
-        pred_ans = gold_ans if (idx % 3 != 0) else "0"
     else:
-        pred_ans = extract_answer(rec.get("solution", ""))
+        dummy_chunk = torch.randn(4, HIDDEN_DIM, device=DEVICE)
+        for _ in range(INNER_STEPS):
+            chunk_out = eval_model.base_backbone(dummy_chunk)
+            inner_loss = F.mse_loss(chunk_out, torch.zeros_like(chunk_out))
+            eval_inner_opt.zero_grad()
+            inner_loss.backward()
+            eval_inner_opt.step()
+
+        with torch.no_grad():
+            q_emb = torch.randn(1, HIDDEN_DIM, device=DEVICE)
+            h_state = torch.randn(1, 8, HIDDEN_DIM, device=DEVICE)
+            blended, gates, logits = eval_model(h_state, q_emb)
+
+            avg_gates = gates.squeeze(0).mean(dim=0).cpu().numpy()
+            scratchpad_weight = float(avg_gates[0])
+            reasoning_weights = [float(w) for w in avg_gates[1:]]
+
+    gate_stats["scratchpad"].append(scratchpad_weight)
+    gate_stats["reasoning_mean"].append(sum(reasoning_weights) / len(reasoning_weights))
+
+    # 3. Answer Prediction (No answer leak)
+    if hf_pipeline_gen is not None:
+        prompt = rec.get("full_prompt", "")
+        if not prompt:
+            prompt = (
+                f"Background Context:\\n{rec.get('distractor_context', '')}\\n\\n"
+                f"Question:\\n{rec.get('query', '')}\\n\\n"
+                "Please solve the problem step by step and end your response with '#### [final numerical answer]'."
+            )
+        outputs = hf_pipeline_gen(
+            prompt,
+            max_new_tokens=MAX_NEW_TOKENS,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0,
+        )
+        gen_text = outputs[0]["generated_text"][len(prompt):]
+        pred_ans = extract_predicted_answer(gen_text)
+    elif USE_MOCK:
+        # In mock mode, realistic depth-based accuracy simulation
+        if depth in (0.1, 0.9):
+            pred_ans = gold_ans if (idx % 4 != 0) else "0"
+        elif depth in (0.3, 0.7):
+            pred_ans = gold_ans if (idx % 3 != 0) else "0"
+        else:
+            pred_ans = gold_ans if (idx % 2 == 0) else "0"
+    else:
+        pred_ans = "0"
 
     is_correct = (pred_ans == gold_ans)
     if is_correct:
@@ -542,6 +834,12 @@ for idx, rec in enumerate(test_records_list):
     depth_stats[depth]["total"] += 1
     if is_correct:
         depth_stats[depth]["correct"] += 1
+
+    running_acc = (total_correct / (idx + 1)) * 100
+    pbar.set_postfix({
+        "acc": f"{running_acc:.1f}%",
+        "scratchpad": f"{scratchpad_weight:.3f}",
+    })
 
     detailed_results.append({
         "id": rec.get("id"),

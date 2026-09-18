@@ -6,6 +6,7 @@ import random
 import sys
 from pathlib import Path
 from typing import List, Tuple
+from tqdm import tqdm
 
 # Ensure src/ is on sys.path even if not installed via pip install -e .
 SRC_DIR = Path(__file__).resolve().parent.parent / "src"
@@ -139,7 +140,8 @@ def main():
     synthesizer = DistractorNeedleSynthesizer(chunk_size=args.chunk_size)
     all_records: List[LongContextGSM8KRecord] = []
 
-    for i, ex in enumerate(examples):
+    pbar = tqdm(examples, desc=f"Synthesizing {args.split} problems", unit="problem")
+    for i, ex in enumerate(pbar):
         decomposed = PremiseQueryDecomposer.decompose(
             problem_text=ex.question,
             solution_text=ex.solution,
@@ -167,8 +169,7 @@ def main():
             )
             all_records.append(rec)
 
-        if (i + 1) % 50 == 0 or (i + 1) == len(examples):
-            print(f"  Processed {i + 1}/{len(examples)} problems ({len(all_records)} total records)")
+        pbar.set_postfix({"records": len(all_records)})
 
     # 3. Export dataset bundle for MoTTT and external baselines
     print(f"\n[3/3] Exporting dataset bundle to {args.output_dir}...")
