@@ -68,20 +68,66 @@ from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import pandas as pd
 
-# Auto-detect workspace root and add src/ to sys.path
+# ---------------------------------------------------------------------------
+# Environment Detection & Repository Resolution (Colab / Phoenix / Local)
+# ---------------------------------------------------------------------------
+IS_COLAB = "google.colab" in sys.modules
+
+# 1. Search upwards from current directory for repository root
 current_dir = Path.cwd().resolve()
-project_root = current_dir
-while project_root.parent != project_root:
-    if (project_root / "src" / "mottt").exists():
+project_root = None
+candidate = current_dir
+while True:
+    if (candidate / "src" / "mottt").exists():
+        project_root = candidate
         break
-    project_root = project_root.parent
+    if candidate.parent == candidate:
+        break
+    candidate = candidate.parent
 
-if str(project_root / "src") not in sys.path:
-    sys.path.insert(0, str(project_root / "src"))
+# 2. Check standard candidate paths if not found via upward traversal
+if project_root is None:
+    for candidate_path in [
+        Path("/content/MoTTT"),
+        Path.cwd() / "MoTTT",
+        Path.home() / "projects" / "MoTTT",
+        Path.home() / "MoTTT",
+    ]:
+        if (candidate_path / "src" / "mottt").exists():
+            project_root = candidate_path.resolve()
+            break
 
-print(f"Project root: {project_root}")
-print(f"PyTorch version: {torch.__version__}")
-print(f"CUDA Available: {torch.cuda.is_available()}")
+# 3. If in Google Colab and MoTTT repository is missing, auto-clone from GitHub
+if IS_COLAB:
+    print("Detected Google Colab environment.")
+    colab_repo_dir = Path("/content/MoTTT")
+    if project_root is None:
+        print("MoTTT repository not found in /content. Cloning from GitHub...")
+        !git clone https://github.com/Jerryliu3547/MoTTT.git /content/MoTTT
+        if (colab_repo_dir / "src" / "mottt").exists():
+            project_root = colab_repo_dir
+
+    if project_root is not None and Path.cwd() != project_root:
+        os.chdir(project_root)
+
+    # In Colab, install essential dependencies and the MoTTT package
+    print("Ensuring dependencies (transformers, accelerate, datasets, peft) are installed...")
+    !pip install -q transformers accelerate datasets peft
+    if project_root and (project_root / "pyproject.toml").exists():
+        !pip install -q -e {project_root}
+
+# Fallback: if project_root is still None, use current_dir (never use root '/')
+if project_root is None or project_root == Path("/"):
+    project_root = current_dir
+
+# Add src/ to sys.path
+src_dir = project_root / "src"
+if src_dir.exists() and str(src_dir) not in sys.path:
+    sys.path.insert(0, str(src_dir))
+
+print(f"Project root:     {project_root}")
+print(f"PyTorch version:  {torch.__version__}")
+print(f"CUDA Available:   {torch.cuda.is_available()}")
 
 # Import MoTTT modules
 from mottt.models.mottt_model import MoTTTModel
@@ -149,7 +195,7 @@ MAX_NEW_TOKENS = 512
 
 # Setup Directory Structure
 OUTPUT_BASE = project_root / "experiments" / "gsm8k"
-DATA_DIR = OUTPUT_BASE / "data"
+DATA_DIR = project_root / "data"
 CKPT_DIR = OUTPUT_BASE / "checkpoints"
 RESULTS_DIR = OUTPUT_BASE / "results"
 

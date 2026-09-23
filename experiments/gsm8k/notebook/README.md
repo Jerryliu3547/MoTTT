@@ -34,10 +34,15 @@ jupyter lab experiments/gsm8k/notebook/
 Select the **Python 3 (ipykernel)** kernel. If no CUDA GPU is detected, both notebooks automatically default to mock/CPU mode for rapid verification.
 
 ### Google Colab
-1. Upload or clone the repository to Google Drive or Colab workspace.
-2. Open either notebook (`gsm8k_experiment.ipynb` or `gsm8k_full_finetune.ipynb`).
-3. Under **Runtime → Change runtime type**, select **GPU** (T4, L4, or A100).
-4. Run all cells in order (`Runtime → Run all`).
+1. Open either notebook (`gsm8k_experiment.ipynb` or `gsm8k_full_finetune.ipynb`) in Google Colab.
+2. Under **Runtime → Change runtime type**, select **GPU** (T4, L4, or A100).
+3. Run all cells in order (`Runtime → Run all`). The environment cell automatically auto-clones the MoTTT repository into `/content/MoTTT`, installs dependencies (`transformers`, `accelerate`, `datasets`, `peft`), and installs `mottt` in editable mode.
+4. *(Optional Manual Setup)* If running in a pre-existing Colab session, you can run:
+   ```bash
+   !git clone https://github.com/Jerryliu3547/MoTTT.git /content/MoTTT
+   %cd /content/MoTTT
+   !pip install -q -e .
+   ```
 
 ### Georgia Tech Phoenix Cluster (Slurm)
 Request an interactive GPU node or launch a Jupyter notebook server on a GPU compute node:

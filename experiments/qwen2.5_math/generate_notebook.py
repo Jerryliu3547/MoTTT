@@ -1,0 +1,220 @@
+import json
+
+notebook = {
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# Qwen2.5-Math-1.5B Evaluation with MoTTT\n",
+    "This notebook evaluates the baseline `Qwen/Qwen2.5-Math-1.5B-Instruct` and compares it to `Qwen/Qwen2.5-Math-1.5B` enhanced with the MoTTT (Test-Time LoRA Scratchpad) method."
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "!git clone https://github.com/Jerryliu3547/MoTTT.git /content/MoTTT\n",
+    "%cd /content/MoTTT\n",
+    "!pip install -q -e .\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "import os\n",
+    "import sys\n",
+    "from pathlib import Path\n",
+    "\n",
+    "# Add src/ to path\n",
+    "SRC_DIR = Path().resolve().parent.parent / \"src\"\n",
+    "if SRC_DIR.exists() and str(SRC_DIR) not in sys.path:\n",
+    "    sys.path.insert(0, str(SRC_DIR))\n",
+    "\n",
+    "import torch\n",
+    "import torch.nn.functional as F\n",
+    "from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline\n",
+    "from mottt.models.mottt_model import MoTTTModel\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 1. Evaluate Baseline (Qwen2.5-Math-1.5B-Instruct)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "baseline_name = \"Qwen/Qwen2.5-Math-1.5B-Instruct\"\n",
+    "device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n",
+    "torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32\n",
+    "\n",
+    "print(f\"Loading {baseline_name}...\")\n",
+    "baseline_tokenizer = AutoTokenizer.from_pretrained(baseline_name, trust_remote_code=True)\n",
+    "baseline_model = AutoModelForCausalLM.from_pretrained(\n",
+    "    baseline_name,\n",
+    "    torch_dtype=torch_dtype,\n",
+    "    device_map=\"auto\" if torch.cuda.is_available() else None,\n",
+    "    trust_remote_code=True\n",
+    ")\n",
+    "\n",
+    "baseline_pipe = pipeline(\n",
+    "    \"text-generation\",\n",
+    "    model=baseline_model,\n",
+    "    tokenizer=baseline_tokenizer,\n",
+    "    max_new_tokens=512,\n",
+    "    do_sample=False\n",
+    ")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "sample_context = \"The treasure is hidden under the old oak tree in the center of the village. The village was founded in 1842.\"\n",
+    "sample_query = \"If I walk 5 miles north from the village center, and then 3 miles east, how far am I from the treasure linearly?\"\n",
+    "\n",
+    "prompt = f\"Background Context:\\n{sample_context}\\n\\nQuestion:\\n{sample_query}\\n\\nPlease solve the problem step by step and end your response with '#### [final numerical answer]'.\"\n",
+    "\n",
+    "outputs = baseline_pipe(prompt)\n",
+    "print(\"Baseline Output:\")\n",
+    "print(\"=\"*40)\n",
+    "print(outputs[0][\"generated_text\"][len(prompt):].strip())\n"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## 2. Evaluate MoTTT Model (Qwen2.5-Math-1.5B + Query-Aware Router)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Note: In a real scenario, you'd load Qwen/Qwen2.5-Math-1.5B base model, \n",
+    "# and load trained mottt_router.pt and reasoning_experts.pt from your checkpoint directory.\n",
+    "\n",
+    "base_name = \"Qwen/Qwen2.5-Math-1.5B\"\n",
+    "print(f\"Loading {base_name} for MoTTT...\")\n",
+    "mottt_tokenizer = AutoTokenizer.from_pretrained(base_name, trust_remote_code=True)\n",
+    "hf_backbone = AutoModelForCausalLM.from_pretrained(\n",
+    "    base_name,\n",
+    "    torch_dtype=torch_dtype,\n",
+    "    device_map=\"auto\" if torch.cuda.is_available() else None,\n",
+    "    trust_remote_code=True\n",
+    ")\n",
+    "\n",
+    "mottt_model = MoTTTModel(\n",
+    "    hidden_dim=hf_backbone.config.hidden_size,\n",
+    "    num_reasoning_experts=4, # Assuming default config\n",
+    "    rank=16,\n",
+    "    alpha=16.0,\n",
+    "    base_backbone=hf_backbone,\n",
+    "    all_linear=True\n",
+    ").to(device)\n",
+    "\n",
+    "# Example: Load your trained checkpoints here\n",
+    "# ckpt_dir = Path(\"../gsm8k/checkpoints\")\n",
+    "# mottt_model.router.load_state_dict(torch.load(ckpt_dir / \"mottt_router.pt\"))\n",
+    "# Add loading logic for reasoning_experts.pt here\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# MoTTT Inner-Loop Adaptation (Dynamic Scratchpad)\n",
+    "mottt_model.reset_scratchpad()\n",
+    "mottt_model.set_routing_gates(None)\n",
+    "\n",
+    "inner_opt = torch.optim.SGD(mottt_model.get_scratchpad_parameters(), lr=1e-3)\n",
+    "inner_steps = 1\n",
+    "\n",
+    "ctx_enc = mottt_tokenizer(sample_context, truncation=True, max_length=256, return_tensors=\"pt\").to(device)\n",
+    "\n",
+    "print(\"Running test-time inner loop adaptation on distractor context...\")\n",
+    "for _ in range(inner_steps):\n",
+    "    ctx_out = hf_backbone(input_ids=ctx_enc.input_ids, attention_mask=ctx_enc.attention_mask)\n",
+    "    shift_logits = ctx_out.logits[..., :-1, :].contiguous()\n",
+    "    shift_labels = ctx_enc.input_ids[..., 1:].contiguous()\n",
+    "    inner_loss = F.cross_entropy(shift_logits.view(-1, hf_backbone.config.vocab_size), shift_labels.view(-1))\n",
+    "    \n",
+    "    inner_opt.zero_grad()\n",
+    "    inner_loss.backward()\n",
+    "    inner_opt.step()\n",
+    "    \n",
+    "print(\"Inner loop complete. Scratchpad adapted.\")\n"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": None,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "# Query-Aware Routing & Generation\n",
+    "q_enc = mottt_tokenizer(sample_query, return_tensors=\"pt\").to(device)\n",
+    "\n",
+    "with torch.no_grad():\n",
+    "    q_emb = hf_backbone.model.embed_tokens(q_enc.input_ids).mean(dim=1)\n",
+    "    # The router expects shape: (batch_size, seq_len, hidden_dim) and (batch_size, hidden_dim)\n",
+    "    gates, _ = mottt_model.router(q_emb.unsqueeze(0).unsqueeze(0), q_emb.unsqueeze(0))\n",
+    "\n",
+    "mottt_model.set_routing_gates(gates)\n",
+    "print(f\"Router Gates: {gates.mean(dim=0).mean(dim=0).tolist()}\")\n",
+    "\n",
+    "# Create pipeline with adapted backbone\n",
+    "mottt_pipe = pipeline(\n",
+    "    \"text-generation\",\n",
+    "    model=hf_backbone,\n",
+    "    tokenizer=mottt_tokenizer,\n",
+    "    max_new_tokens=512,\n",
+    "    do_sample=False\n",
+    ")\n",
+    "\n",
+    "outputs = mottt_pipe(prompt)\n",
+    "print(\"\\nMoTTT Output:\")\n",
+    "print(\"=\"*40)\n",
+    "print(outputs[0][\"generated_text\"][len(prompt):].strip())\n",
+    "\n",
+    "# Clean up\n",
+    "mottt_model.reset_scratchpad()\n"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "name": "python"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
+
+with open('/home/jerry/projects/MoTTT/experiments/qwen2.5_math/eval_mottt_vs_baseline.ipynb', 'w') as f:
+    json.dump(notebook, f, indent=1)
+
+print("Notebook generated successfully.")
